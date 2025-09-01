@@ -1,8 +1,20 @@
 # -*- coding: utf-8 -*-
 
+# Start manually added imports
+from typing import Optional, Union, Tuple, List
+
+import torch
+from torch import nn
+from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
+from transformers import add_start_docstrings, MistralConfig, Cache, DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast, TokenClassifierOutput
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer, MistralRMSNorm
+from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
+# End manually added imports
+
+
 from transformers.models.mistral.modeling_mistral import *
 from transformers.modeling_attn_mask_utils import  _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
-from transformers.modeling_outputs import TokenClassifierOutput
 
 from .config import BiLLM_START_INDEX, logger
 
@@ -12,7 +24,7 @@ _CONFIG_FOR_DOC = "MistralConfig"
 
 @add_start_docstrings(
     "The bare Mistral Model outputting raw hidden-states without any specific head on top.",
-    MISTRAL_START_DOCSTRING,
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
 class MistralModel(MistralPreTrainedModel):
     """
@@ -50,7 +62,7 @@ class MistralModel(MistralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(MISTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -229,7 +241,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(MISTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -389,7 +401,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
     """
     The Bi-Mistral Model transformer with a token classification head on top (linear layer).
     """,
-    MISTRAL_START_DOCSTRING,
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
 class MistralForTokenClassification(MistralPreTrainedModel):
     def __init__(self, config):
@@ -414,7 +426,7 @@ class MistralForTokenClassification(MistralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(MISTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -482,7 +494,7 @@ class MistralForTokenClassification(MistralPreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    MISTRAL_START_DOCSTRING,
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
 # Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Mistral, LLAMA->MISTRAL
 class MistralForSequenceClassification(MistralPreTrainedModel):
@@ -501,7 +513,7 @@ class MistralForSequenceClassification(MistralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(MISTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,

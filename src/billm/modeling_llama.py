@@ -1,5 +1,18 @@
 # -*- coding: utf-8 -*-
 
+# Start manually added imports
+from typing import Optional, Union, Tuple, List
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
+from transformers import add_start_docstrings, LlamaConfig, StaticCache, DynamicCache, Cache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
+from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
+# End manually added imports
+
 from transformers.models.llama.modeling_llama import *
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import TokenClassifierOutput
@@ -12,7 +25,7 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 
 @add_start_docstrings(
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
-    LLAMA_START_DOCSTRING,
+    "LLAMA_START_DOCSTRING removed in current transformers version.",
 )
 class LlamaModel(LlamaPreTrainedModel):
     """
@@ -49,7 +62,7 @@ class LlamaModel(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("LLAMA_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -254,7 +267,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("LLAMA_INPUTS_DOCSTRING removed in current transformers version.")
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -445,7 +458,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     """
     The Bi-LLaMa Model transformer with a token classification head on top (linear layer).
     """,
-    LLAMA_START_DOCSTRING,
+    "LLAMA_START_DOCSTRING removed in current transformers version.",
 )
 class LlamaForTokenClassification(LlamaPreTrainedModel):
     def __init__(self, config):
@@ -470,7 +483,7 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("LLAMA_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -538,7 +551,7 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    LLAMA_START_DOCSTRING,
+    "LLAMA_START_DOCSTRING removed in current transformers version.",
 )
 class LlamaForSequenceClassification(LlamaPreTrainedModel):
     def __init__(self, config):
@@ -556,7 +569,7 @@ class LlamaForSequenceClassification(LlamaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward("LLAMA_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
