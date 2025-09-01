@@ -1,5 +1,9 @@
 # My stuff
 envs.env
+.idea
+
+# Local models
+models
 
 
 # Byte-compiled / optimized / DLL files
