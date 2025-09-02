@@ -19,8 +19,8 @@ hf_token = os.getenv("HF_TOKEN")
 from transformers import AutoTokenizer
 from src.billm import LlamaForSequenceClassification, Gemma3ForSequenceClassification
 
-# model_name_hf = "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen"
-model_name_hf = "danish-foundation-models/gemma-3-1b-cpt-dynaword-full-v1"
+model_name_hf = "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen"
+# model_name_hf = "danish-foundation-models/gemma-3-1b-cpt-dynaword-full-v1"
 
 match model_name_hf:
     case "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen":
