@@ -311,8 +311,28 @@ def test_training_step(model_path: str, model_type: str, task_type: str) -> Dict
     print(f"\n🔍 Testing {task_type.replace('_', ' ').title()} Training Step...")
     results = {"success": False, "error": None, "loss_value": None, "task_type": task_type}
 
+    model = None
+    optimizer = None
+
     try:
-        # Load model based on task type
+        # Clear GPU memory if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
+        # Smart device selection with fallback
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            print(f"Using CUDA device: {torch.cuda.get_device_name()}")
+        elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            print("Using MPS device")
+        else:
+            device = torch.device("cpu")
+            print("Using CPU device")
+
+        # Load model with memory-efficient settings
         if task_type == 'sequence_classification':
             model = load_model_for_task(model_path, model_type, task_type, num_labels=2)
         elif task_type == 'token_classification':
@@ -320,37 +340,105 @@ def test_training_step(model_path: str, model_type: str, task_type: str) -> Dict
         else:  # causal_lm
             model = load_model_for_task(model_path, model_type, task_type)
 
-        model.train()
-        optimizer = AdamW(model.parameters(), lr=1e-5)
+        # Move model to device with error handling for large models
+        try:
+            model = model.to(device)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            if device.type != "cpu":
+                print(f"⚠️ GPU memory insufficient, falling back to CPU. Error: {e}")
+                device = torch.device("cpu")
+                model = model.to(device)
+            else:
+                raise e
 
-        # Create task-specific training data
+        model.train()
+
+        # Use only parameters that require gradients for the optimizer
+        # For classification tasks, often only the classification head needs training
+        if task_type in ['sequence_classification', 'token_classification']:
+            # Only train the classification head to save memory
+            if hasattr(model, 'classifier'):
+                trainable_params = list(model.classifier.parameters())
+            elif hasattr(model, 'score'):
+                trainable_params = list(model.score.parameters())
+            else:
+                # Fallback to all parameters
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+        else:
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+        # Not enough memory to fine-tune all parameters on large models on my mac
+        # trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+        print(f"Total model parameters: {sum(p.numel() for p in model.parameters())}")
+        print(f"Number of trainable parameters: {sum(p.numel() for p in trainable_params)}")
+
+        optimizer = AdamW(trainable_params, lr=1e-5)
+
+        # Dummy batch size and sequence length
         batch_size = 2
         seq_length = 64
-        input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_length))
+
+        # Set vocab size
+        # vocab_size = min(model.config.vocab_size, 32000)  # Cap to reasonable size
+        vocab_size = model.config.vocab_size
+        print(f"Original vocab_size: {model.config.vocab_size} \nUsing vocab_size: {vocab_size}")
+
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
         attention_mask = torch.ones_like(input_ids)
 
         if task_type == 'sequence_classification':
-            labels = torch.randint(0, 2, (batch_size,))  # Binary classification
+            labels = torch.randint(0, 2, (batch_size,), device=device)  # Binary classification
         elif task_type == 'token_classification':
-            labels = torch.randint(0, 9, (batch_size, seq_length))  # Token-level labels
+            labels = torch.randint(0, 9, (batch_size, seq_length), device=device)  # Token-level labels
         else:  # causal_lm
             labels = input_ids.clone()  # Next token prediction
 
-        # Training step
+        # Training step with gradient accumulation to save memory
         optimizer.zero_grad()
+
+        # Use gradient checkpointing if available to save memory
+        # if hasattr(model, 'gradient_checkpointing_enable'):
+        #     model.gradient_checkpointing_enable()
+
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = outputs.loss
+
+        # Scale loss if needed
+        # loss = loss / 1  # No gradient accumulation for this test
         loss.backward()
+
+        # Clip gradients to prevent explosion
+        # torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+
         optimizer.step()
 
         results["success"] = True
         results["loss_value"] = loss.item()
-        print(f"✅ {task_type.replace('_', ' ').title()} training step successful! Loss: {loss.item():.4f}")
+        results["device_used"] = str(device)
+        print(f"✅ {task_type.replace('_', ' ').title()} training step successful! Loss: {loss.item():.4f} (Device: {device})")
 
     except Exception as e:
         results["error"] = str(e)
         print(f"❌ Training step failed: {e}")
         traceback.print_exc()
+
+    finally:
+        # Clean up memory
+        if model is not None:
+            del model
+        if optimizer is not None:
+            del optimizer
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+        # Clear GPU memory if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     return results
 
@@ -509,14 +597,6 @@ def generate_summary_report(all_results: Dict[str, Any], model_path: str, model_
 
     print("-" * 80)
     print(f"Overall Result: {passed_tests}/{total_tests} tests passed")
-
-    if passed_tests == total_tests:
-        print(
-            f"🎉 ALL TESTS PASSED! Your BiLLM {model_type.upper()} {task_type.replace('_', ' ')} conversion was successful!")
-    elif passed_tests >= total_tests * 0.8:
-        print("⚠️  Most tests passed. Check failed tests for minor issues.")
-    else:
-        print("❌ Multiple tests failed. Please review your conversion process.")
 
     print("=" * 80)
 
