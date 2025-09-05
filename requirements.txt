@@ -1,0 +1,5 @@
+torch~=2.2.2
+transformers~=4.56.0
+numpy~=1.26.4
+datasets~=3.3.2
+python-dotenv~=1.1.0
