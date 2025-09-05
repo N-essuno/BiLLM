@@ -182,48 +182,48 @@ def compute_metrics(eval_pred):
         "f1": f1_score["f1"]
     }
 
+# training_args = TrainingArguments(
+#     output_dir=f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt",
+#     per_device_train_batch_size=8,
+#     per_device_eval_batch_size=16,
+#     gradient_accumulation_steps=8,
+#     learning_rate=2e-4,
+#     warmup_steps=30,
+#     max_steps=300,
+#     lr_scheduler_type="cosine",
+#     weight_decay=0.05,
+#     max_grad_norm=1.0,
+#     gradient_checkpointing=True,
+#     metric_for_best_model="matthews_correlation",
+#     greater_is_better=True,
+#     eval_strategy="steps",
+#     eval_steps=15,
+#     save_strategy="steps",
+#     save_steps=30,
+#     load_best_model_at_end=True,
+#     push_to_hub=args.push_to_hub,
+#     hub_model_id=args.hub_model_id,
+# )
+
+
+# Training arguments
 training_args = TrainingArguments(
     output_dir=f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt",
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=16,
-    gradient_accumulation_steps=8,
-    learning_rate=2e-4,
-    warmup_steps=30,
-    max_steps=300,
-    lr_scheduler_type="cosine",
-    weight_decay=0.05,
-    max_grad_norm=1.0,
-    gradient_checkpointing=True,
+    learning_rate=args.learning_rate,
+    per_device_train_batch_size=args.batch_size,
+    per_device_eval_batch_size=args.batch_size,
+    num_train_epochs=args.epochs,
+    weight_decay=args.weight_decay,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
     metric_for_best_model="matthews_correlation",
     greater_is_better=True,
-    eval_strategy="steps",
-    eval_steps=15,
-    save_strategy="steps",
-    save_steps=30,
-    load_best_model_at_end=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
 )
 
-
-# # Training arguments
-# training_args = TrainingArguments(
-#     output_dir=f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt",
-#     learning_rate=args.learning_rate,
-#     per_device_train_batch_size=args.batch_size,
-#     per_device_eval_batch_size=args.batch_size,
-#     num_train_epochs=args.epochs,
-#     weight_decay=args.weight_decay,
-#     eval_strategy="epoch",
-#     save_strategy="epoch",
-#     load_best_model_at_end=True,
-#     metric_for_best_model="matthews_correlation",
-#     greater_is_better=True,
-#     push_to_hub=args.push_to_hub,
-#     hub_model_id=args.hub_model_id,
-# )
-# patience = 20
-
+patience = 20
 # Initialize trainer
 trainer = Trainer(
     model=model,
@@ -233,7 +233,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    # callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
 )
 
 # Train the model
