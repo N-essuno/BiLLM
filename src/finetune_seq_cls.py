@@ -11,7 +11,7 @@ import argparse
 import numpy as np
 import evaluate
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, EarlyStoppingCallback
 from transformers import DataCollatorWithPadding
 from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
@@ -199,7 +199,7 @@ training_args = TrainingArguments(
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
 )
-
+patience = 20
 # Initialize trainer
 trainer = Trainer(
     model=model,
@@ -209,6 +209,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
 )
 
 # Train the model
