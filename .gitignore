@@ -1,6 +1,7 @@
 # My stuff
 envs.env
 .idea
+billm_dala_*
 
 # Local models
 models
