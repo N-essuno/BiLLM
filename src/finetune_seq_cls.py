@@ -5,6 +5,7 @@ import os
 
 load_dotenv(os.getcwd() + '/../envs.env')
 hf_token = os.getenv("HF_TOKEN")
+hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
 
 import argparse
 
@@ -19,18 +20,20 @@ from billm import LlamaForSequenceClassification, MistralForSequenceClassificati
     OpenELMForSequenceClassification, Gemma3ForSequenceClassification
 import torch
 
+from transformers.trainer_utils import IntervalStrategy
+from transformers.training_args import OptimizerNames, TrainingArguments
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name_or_path', type=str,
-                    default='danish-foundation-models/gemma-3-1b-cpt-dynaword-full-v1',
                     help='Specify model_name_or_path to set transformer backbone.')
 parser.add_argument('--dataset_name_or_path', type=str, default='dala',
                     help='Specify huggingface dataset name or local file path. Default is dala.')
-parser.add_argument('--epochs', type=int, default=3, help='Specify number of epochs, default 3')
+parser.add_argument('--epochs', type=int, default=10, help='Specify number of epochs, default 10')
 parser.add_argument('--batch_size', type=int, default=8, help='Specify number of batch size, default 8')
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='Specify learning rate, default 1e-4')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
-parser.add_argument('--max_length', type=int, default=512, help='Specify max length, default 512')
-parser.add_argument('--lora_r', type=int, default=32, help='Specify lora r, default 32')
+parser.add_argument('--max_length', type=int, default=64, help='Specify max length, default 64')
+parser.add_argument('--lora_r', type=int, default=12, help='Specify lora r, default 12')
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
 # configure hub
@@ -66,21 +69,17 @@ num_labels = len(label2id)
 print(f"Detected {num_labels} labels: {label2id}")
 
 # Initialize model based on model name
+lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 if 'mistral' in args.model_name_or_path.lower():
     MODEL = MistralForSequenceClassification
-    lora_target_modules = ["q_proj", "v_proj"]
 elif 'llama' in args.model_name_or_path.lower():
     MODEL = LlamaForSequenceClassification
-    lora_target_modules = ["q_proj", "v_proj"]
 elif 'qwen2' in args.model_name_or_path.lower():
     MODEL = Qwen2ForSequenceClassification
-    lora_target_modules = ["q_proj", "v_proj"]
 elif 'openelm' in args.model_name_or_path.lower():
     MODEL = OpenELMForSequenceClassification
-    lora_target_modules = ["q_proj", "v_proj"]
-elif any(x in args.model_name_or_path.lower() for x in ['gemma3', 'gemma-3', 'gemma_3']):
+elif any(x in args.model_name_or_path.lower() for x in ['gemma3', 'gemma-3', 'gemma_3', 'student']):
     MODEL = Gemma3ForSequenceClassification
-    lora_target_modules = ["q_proj", "v_proj"]
 else:
     raise NotImplementedError(
         f"Model {args.model_name_or_path} not supported.")
@@ -155,7 +154,7 @@ def preprocess_function(examples):
 tokenized_ds = ds.map(preprocess_function, batched=True, remove_columns=ds["train"].column_names)
 
 # Data collator for padding
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
 
 # Load metrics
 accuracy = evaluate.load("accuracy")
@@ -182,46 +181,46 @@ def compute_metrics(eval_pred):
         "f1": f1_score["f1"]
     }
 
-# training_args = TrainingArguments(
-#     output_dir=f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt",
-#     per_device_train_batch_size=8,
-#     per_device_eval_batch_size=16,
-#     gradient_accumulation_steps=8,
-#     learning_rate=2e-4,
-#     warmup_steps=30,
-#     max_steps=300,
-#     lr_scheduler_type="cosine",
-#     weight_decay=0.05,
-#     max_grad_norm=1.0,
-#     gradient_checkpointing=True,
-#     metric_for_best_model="matthews_correlation",
-#     greater_is_better=True,
-#     eval_strategy="steps",
-#     eval_steps=15,
-#     save_strategy="steps",
-#     save_steps=30,
-#     load_best_model_at_end=True,
-#     push_to_hub=args.push_to_hub,
-#     hub_model_id=args.hub_model_id,
-# )
+i = 2
+output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
-
-# Training arguments
+# Adapted from src/euroeval/finetuning.py
 training_args = TrainingArguments(
-    output_dir=f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt",
-    learning_rate=args.learning_rate,
-    per_device_train_batch_size=args.batch_size,
+    output_dir=output_dir,
+    eval_strategy=IntervalStrategy.STEPS,
+    save_strategy=IntervalStrategy.STEPS,
+    eval_steps=30,
+    logging_steps=30,
+    save_steps=30,
+    max_steps=10_000,  # (1 if testing)
+    report_to=[],
+    save_total_limit=1,
+    per_device_train_batch_size=args.batch_size,  # Default varies
     per_device_eval_batch_size=args.batch_size,
-    num_train_epochs=args.epochs,
-    weight_decay=args.weight_decay,
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    eval_accumulation_steps=32,
+    optim=OptimizerNames.ADAMW_TORCH,
+    learning_rate=args.learning_rate,  # EuroEval default is 2e-5
+    warmup_ratio=0.01,   # 1% warmup
+    gradient_accumulation_steps=32 // args.batch_size,
     load_best_model_at_end=True,
-    metric_for_best_model="matthews_correlation",
-    greater_is_better=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
 )
+
+
+# Training arguments
+# training_args = TrainingArguments(
+#     output_dir=output_dir,
+#     learning_rate=args.learning_rate,
+#     per_device_train_batch_size=args.batch_size,
+#     per_device_eval_batch_size=args.batch_size,
+#     num_train_epochs=args.epochs,
+#     weight_decay=args.weight_decay,
+#     eval_strategy="epoch",
+#     save_strategy="epoch",
+#     load_best_model_at_end=True,
+#     metric_for_best_model="matthews_correlation",
+# )
 
 patience = 20
 # Initialize trainer
@@ -242,3 +241,12 @@ trainer.train()
 # Push the best model to the hub
 if args.push_to_hub:
     trainer.push_to_hub()
+
+# Evaluate the model
+eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
+print(f"Eval results: {eval_results}")
+
+"""
+2dyna_ckpt_2
+Eval results: {'eval_loss': 0.7903671264648438, 'eval_accuracy': 0.498046875, 'eval_matthews_correlation': -0.007362700356183045, 'eval_f1': 0.1288135593220339, 'eval_runtime': 9.5042, 'eval_samples_per_second': 215.484, 'eval_steps_per_second': 26.935, 'epoch': 113.4375}
+"""
