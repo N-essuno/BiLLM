@@ -19,8 +19,9 @@ hf_token = os.getenv("HF_TOKEN")
 from transformers import AutoTokenizer
 from src.billm import LlamaForSequenceClassification, Gemma3ForSequenceClassification
 
-model_name_hf = "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen"
+# model_name_hf = "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen"
 # model_name_hf = "danish-foundation-models/gemma-3-1b-cpt-dynaword-full-v1"
+model_name_hf = "../new_models/student_step31816_2dyna/"
 
 match model_name_hf:
     case "danish-foundation-models/Meta-Llama-3.1-8B-laerebogen":
@@ -29,6 +30,9 @@ match model_name_hf:
     case "danish-foundation-models/gemma-3-1b-cpt-dynaword-full-v1":
         model = Gemma3ForSequenceClassification.from_pretrained(model_name_hf, token=hf_token)
         local_dir = "models/billm_gemma_3_1b_cpt_dynaword_full_v1"
+    case "../new_models/student_step31816_2dyna/":
+        model = Gemma3ForSequenceClassification.from_pretrained(model_name_hf)
+        local_dir = "../new_converted_models/student_step31816_2dyna_conv"
     case _:
         raise ValueError(f"Model {model_name_hf} not supported.")
 
