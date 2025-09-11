@@ -10,6 +10,14 @@ from transformers import DataCollatorForTokenClassification
 from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
 from billm import LlamaForTokenClassification, MistralForTokenClassification
+from dotenv import load_dotenv
+import os
+
+envs_dir = os.getcwd() + '/envs.env'
+print(f"Loading envs from: {envs_dir}")
+load_dotenv(envs_dir)
+hf_token = os.getenv("HF_TOKEN")
+hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
 
 
 parser = argparse.ArgumentParser()
@@ -55,7 +63,7 @@ elif 'llama' in args.model_name_or_path.lower():
 else:
     raise NotImplementedError
 model = MODEL.from_pretrained(
-    args.model_name_or_path, num_labels=len(label2id), id2label=id2label, label2id=label2id
+    args.model_name_or_path, num_labels=len(label2id), id2label=id2label, label2id=label2id, token=hf_token
 ).bfloat16()
 peft_config = LoraConfig(task_type=TaskType.TOKEN_CLS,
                          inference_mode=False,
@@ -140,3 +148,14 @@ trainer.train()
 # push the best model to the hub
 if args.push_to_hub:
     trainer.push_to_hub()
+
+"""
+$ cd examples
+$ WANDB_MODE=disabled BiLLM_START_INDEX=0 CUDA_VISIBLE_DEVICES=3 python billm_ner.py \
+--model_name_or_path mistralai/Mistral-7B-v0.1 \
+--dataset_name_or_path conll2003 \
+--push_to_hub 0
+
+BiLLM_START_INDEX=0 python src/billm_ner.py --model_name_or_path mistralai/Mistral-7B-v0.1 --dataset_name_or_path conll2003 --push_to_hub 0
+
+"""
