@@ -3,16 +3,12 @@
 from dotenv import load_dotenv
 import os
 
-load_dotenv(os.getcwd() + '/../envs.env')
-hf_token = os.getenv("HF_TOKEN")
-hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
-
 import argparse
 
 import numpy as np
 import evaluate
 from datasets import load_dataset
-from transformers import AutoTokenizer, EarlyStoppingCallback
+from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback
 from transformers import DataCollatorWithPadding
 from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
@@ -22,6 +18,12 @@ import torch
 
 from transformers.trainer_utils import IntervalStrategy
 from transformers.training_args import OptimizerNames, TrainingArguments
+
+envs_dir = os.getcwd() + '/envs.env'
+print(f"Loading envs from: {envs_dir}")
+load_dotenv(envs_dir)
+hf_token = os.getenv("HF_TOKEN")
+hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name_or_path', type=str,
@@ -49,9 +51,12 @@ if 'mistral' in args.model_name_or_path.lower():
 elif tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Load dataset and inspect structure (Fix 2: Dataset inspection)
+# Load dataset and inspect structure
 if args.dataset_name_or_path == 'dala':
     ds = load_dataset("giannor/dala", token=hf_token)
+    label2id = {"correct": 0, "incorrect": 1}
+elif args.dataset_name_or_path == 'scala':
+    ds = load_dataset("EuroEval/scala-da", token=hf_token_euroeval)
     label2id = {"correct": 0, "incorrect": 1}
 else:
     # For custom datasets, you'll need to define label2id mapping
@@ -83,6 +88,7 @@ elif any(x in args.model_name_or_path.lower() for x in ['gemma3', 'gemma-3', 'ge
 else:
     raise NotImplementedError(
         f"Model {args.model_name_or_path} not supported.")
+
 
 model = MODEL.from_pretrained(
     args.model_name_or_path,
@@ -185,42 +191,42 @@ i = 2
 output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Adapted from src/euroeval/finetuning.py
-# training_args = TrainingArguments(
-#     output_dir=output_dir,
-#     eval_strategy=IntervalStrategy.STEPS,
-#     save_strategy=IntervalStrategy.STEPS,
-#     eval_steps=30,
-#     logging_steps=30,
-#     save_steps=30,
-#     max_steps=10_000,  # (1 if testing)
-#     report_to=[],
-#     save_total_limit=1,
-#     per_device_train_batch_size=args.batch_size,  # Default varies
-#     per_device_eval_batch_size=args.batch_size,
-#     eval_accumulation_steps=32,
-#     optim=OptimizerNames.ADAMW_TORCH,
-#     learning_rate=args.learning_rate,  # EuroEval default is 2e-5
-#     warmup_ratio=0.01,   # 1% warmup
-#     gradient_accumulation_steps=32 // args.batch_size,
-#     load_best_model_at_end=True,
-#     push_to_hub=args.push_to_hub,
-#     hub_model_id=args.hub_model_id,
-# )
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    eval_strategy=IntervalStrategy.STEPS,
+    save_strategy=IntervalStrategy.STEPS,
+    eval_steps=30,
+    logging_steps=30,
+    save_steps=30,
+    max_steps=10_000,  # (1 if testing)
+    report_to=[],
+    save_total_limit=1,
+    per_device_train_batch_size=args.batch_size,  # Default varies
+    per_device_eval_batch_size=args.batch_size,
+    eval_accumulation_steps=32,
+    optim=OptimizerNames.ADAMW_TORCH,
+    learning_rate=args.learning_rate,  # EuroEval default is 2e-5
+    warmup_ratio=0.01,   # 1% warmup
+    gradient_accumulation_steps=32 // args.batch_size,
+    load_best_model_at_end=True,
+    push_to_hub=args.push_to_hub,
+    hub_model_id=args.hub_model_id,
+)
 
 
 # Training arguments
-training_args = TrainingArguments(
-    output_dir=output_dir,
-    learning_rate=args.learning_rate,
-    per_device_train_batch_size=args.batch_size,
-    per_device_eval_batch_size=args.batch_size,
-    num_train_epochs=args.epochs,
-    weight_decay=args.weight_decay,
-    eval_strategy="epoch",
-    save_strategy="epoch",
-    load_best_model_at_end=True,
-    metric_for_best_model="matthews_correlation",
-)
+# training_args = TrainingArguments(
+#     output_dir=output_dir,
+#     learning_rate=args.learning_rate,
+#     per_device_train_batch_size=args.batch_size,
+#     per_device_eval_batch_size=args.batch_size,
+#     num_train_epochs=args.epochs,
+#     weight_decay=args.weight_decay,
+#     eval_strategy="epoch",
+#     save_strategy="epoch",
+#     load_best_model_at_end=True,
+#     metric_for_best_model="matthews_correlation",
+# )
 
 patience = 20
 # Initialize trainer
@@ -249,4 +255,20 @@ print(f"Eval results: {eval_results}")
 """
 2dyna_ckpt_2
 Eval results: {'eval_loss': 0.7903671264648438, 'eval_accuracy': 0.498046875, 'eval_matthews_correlation': -0.007362700356183045, 'eval_f1': 0.1288135593220339, 'eval_runtime': 9.5042, 'eval_samples_per_second': 215.484, 'eval_steps_per_second': 26.935, 'epoch': 113.4375}
+
+2dyna_ckpt_3
+Eval results: {'eval_loss': 0.76373291015625, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.004259408910874128, 'eval_f1': 0.10193321616871705, 'eval_runtime': 9.7504, 'eval_samples_per_second': 210.043, 'eval_steps_per_second': 26.255, 'epoch': 61.875}
+
+Gemma 12b finetuning from BiLLM
+Eval results: {'eval_loss': 0.7579193115234375, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.003703221148025842, 'eval_f1': 0.6497601096641535, 'eval_runtime': 17.7082, 'eval_samples_per_second': 115.653, 'eval_steps_per_second': 14.457, 'epoch': 10.0}
+
+Gemma 12b finetuning adapted from EuroEval
+
+
+"""
+
+
+"""
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --dataset_name_or_path scala
 """
