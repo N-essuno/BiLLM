@@ -2,6 +2,8 @@
 envs.env
 .idea
 billm_dala_*
+billm_conll2003_*
+billm_scala_*
 
 # Local models
 models
