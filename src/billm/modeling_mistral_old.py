@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 
-from transformers import MistralConfig, MistralPreTrainedModel, MistralModel as OriginalMistralModel
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer, MistralRMSNorm, MistralRotaryEmbedding
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
-from transformers.modeling_outputs import TokenClassifierOutput, SequenceClassifierOutputWithPast
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
-from transformers.utils.deprecation import deprecate_kwarg
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
-from torch import nn
+# Start manually added imports
+from typing import Optional, Union, Tuple, List
+
 import torch
-from typing import Optional, Tuple, Union, List
+from torch import nn
+from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
+from transformers import add_start_docstrings, MistralConfig, Cache, DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast, TokenClassifierOutput
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer, MistralRMSNorm, MistralRotaryEmbedding
+from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
+# End manually added imports
+
+
+from transformers.models.mistral.modeling_mistral import *
+from transformers.modeling_attn_mask_utils import  _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
 
 from .config import BiLLM_START_INDEX, logger
 
@@ -23,9 +23,10 @@ _CONFIG_FOR_DOC = "MistralConfig"
 
 
 @add_start_docstrings(
-    "The bare Mistral Model outputting raw hidden-states without any specific head on top."
+    "The bare Mistral Model outputting raw hidden-states without any specific head on top.",
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
-class MistralModel(OriginalMistralModel):
+class MistralModel(MistralPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MistralDecoderLayer`]
 
@@ -35,145 +36,188 @@ class MistralModel(OriginalMistralModel):
 
     def __init__(self, config: MistralConfig):
         super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.bidirectionas = [BiLLM_START_INDEX > -1 and layer_idx >= BiLLM_START_INDEX
                               for layer_idx in range(config.num_hidden_layers)]
-        
+        self.layers = nn.ModuleList(
+            [MistralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self._attn_implementation = config._attn_implementation
+        self.norm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # added
+        self.rotary_emb = MistralRotaryEmbedding(config)
+        # end added
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
         if BiLLM_START_INDEX > -1:
             logger.info(f'Here is the Bi-MistralModel! BiLLM_START_INDEX={BiLLM_START_INDEX}')
         else:
             logger.info(f'BiLLM_START_INDEX={BiLLM_START_INDEX}, BiLLM is disabled.')
 
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        # If BiLLM is disabled or not needed, use parent implementation
-        if BiLLM_START_INDEX < 0 or not any(self.bidirectionas):
-            return super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                cache_position=cache_position,
-                **kwargs,
-            )
-        
-        # Custom implementation for BiLLM with bidirectional attention
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        # Use the parent's input processing logic
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+        elif input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        past_key_values_length = 0
+
+        if use_cache:
+            use_legacy_cache = not isinstance(past_key_values, Cache)
+            if use_legacy_cache:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            # past_key_values_length = past_key_values.get_usable_length(seq_length)
+            past_key_values_length = past_key_values.get_seq_length() # FIXME : updated line
+
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
+            is_padding_right = attention_mask[:, -1].sum().item() != batch_size
+            if is_padding_right:
+                raise ValueError(
+                    "You are attempting to perform batched generation with padding_side='right'"
+                    " this may lead to unexpected behaviour for Flash Attention version of Mistral. Make sure to "
+                    " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
+                )
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        if self._attn_implementation == "flash_attention_2":
+            # 2d mask is passed through the layers
+            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+        elif self._attn_implementation == "sdpa" and not output_attentions:
+            # output_attentions=True can not be supported when using SDPA, and we fall back on
+            # the manual implementation that requires a 4D causal mask in all cases.
+            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
             )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        # Create causal mask using the parent's logic
-        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
-        causal_mask = mask_function(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-        
-        # Create bidirectional mask by removing causal constraints
-        bidirectional_mask = self._create_bidirectional_mask(causal_mask, inputs_embeds.device)
+        else:
+            # 4d mask is passed through the layers
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+                sliding_window=self.config.sliding_window,
+            )
+        bi_attention_mask = torch.zeros_like(attention_mask) if attention_mask is not None else None
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Initialize output collections
+        # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
 
-        # Process through layers with selective bidirectional attention
-        for layer_idx, (is_bidirectional, decoder_layer) in enumerate(zip(self.bidirectionas, self.layers[:self.config.num_hidden_layers])):
+        # added
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # end added
+
+        for is_bidirectional, decoder_layer in zip(self.bidirectionas, self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-                
-            # Choose appropriate attention mask
-            current_mask = bidirectional_mask if is_bidirectional else causal_mask
-            
-            hidden_states = decoder_layer(
-                hidden_states,
-                attention_mask=current_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    bi_attention_mask if is_bidirectional else attention_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=bi_attention_mask if is_bidirectional else attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    # position_embeddings=position_embeddings,  # added
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-        
-        # Add hidden states from the last decoder layer
+
+        # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-        
+
+        next_cache = None
+        if use_cache:
+            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+
         if not return_dict:
-            return tuple(v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None)
-        
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-    
-    def _create_bidirectional_mask(self, causal_mask: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """
-        Create a bidirectional attention mask by modifying the causal mask.
-        For bidirectional attention, we remove the causal constraints but preserve padding masks.
-        """
-        if causal_mask is None:
-            return None
-            
-        # Create bidirectional mask by setting all non-padding positions to 0 (allow attention)
-        # Keep -inf values for padding positions to prevent attention to padding tokens
-        bidirectional_mask = torch.zeros_like(causal_mask)
-        
-        # Preserve padding mask: copy -inf values from causal mask
-        # In causal masks, -inf indicates positions that should not be attended to
-        padding_positions = (causal_mask == float('-inf'))
-        bidirectional_mask = torch.where(padding_positions, causal_mask, bidirectional_mask)
-        
-        return bidirectional_mask
 
 
 class MistralForCausalLM(MistralPreTrainedModel):
@@ -206,22 +250,20 @@ class MistralForCausalLM(MistralPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING")
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -266,8 +308,6 @@ class MistralForCausalLM(MistralPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
         )
 
         hidden_states = outputs[0]
@@ -300,7 +340,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, cache_position=None, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
@@ -340,11 +380,6 @@ class MistralForCausalLM(MistralPreTrainedModel):
             if past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
 
-        if cache_position is None:
-            cache_position = torch.arange(
-                past_length, past_length + input_ids.shape[1], device=input_ids.device
-            )
-
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
@@ -357,7 +392,6 @@ class MistralForCausalLM(MistralPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "cache_position": cache_position,
             }
         )
         return model_inputs
@@ -376,7 +410,7 @@ class MistralForCausalLM(MistralPreTrainedModel):
     """
     The Bi-Mistral Model transformer with a token classification head on top (linear layer).
     """,
-    "MISTRAL_START_DOCSTRING",
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
 class MistralForTokenClassification(MistralPreTrainedModel):
     def __init__(self, config):
@@ -401,21 +435,19 @@ class MistralForTokenClassification(MistralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING")
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, TokenClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -435,8 +467,6 @@ class MistralForTokenClassification(MistralPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
         )
         sequence_output = outputs[0]
 
@@ -473,7 +503,7 @@ class MistralForTokenClassification(MistralPreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    "MISTRAL_START_DOCSTRING",
+    "MISTRAL_START_DOCSTRING removed in current transformers version.",
 )
 # Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Mistral, LLAMA->MISTRAL
 class MistralForSequenceClassification(MistralPreTrainedModel):
@@ -492,21 +522,19 @@ class MistralForSequenceClassification(MistralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING")
+    @add_start_docstrings_to_model_forward("MISTRAL_INPUTS_DOCSTRING removed in current transformers version.")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -526,8 +554,6 @@ class MistralForSequenceClassification(MistralPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            cache_position=cache_position,
-            **kwargs,
         )
         hidden_states = transformer_outputs[0]
         logits = self.score(hidden_states)
