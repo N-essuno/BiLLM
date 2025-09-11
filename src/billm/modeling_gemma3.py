@@ -38,13 +38,22 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
     """
 
     def __init__(self, config: Gemma3TextConfig):
+        try:
+            temp_num_hidden_layers = config.num_hidden_layers
+            temp_hidden_size = config.hidden_size
+            temp_vocab_size = config.vocab_size
+        except AttributeError:
+            print("Warning: config attributes not found, trying replacing config with config.get_text_config()")
+            config = config.get_text_config()
+
         super().__init__(config)
+
         self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
+        self.vocab_size = config.get_text_config().vocab_size
 
         # Gemma3 downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size ** 0.5
+            self.vocab_size, config.hidden_size, self.padding_idx, embed_scale=config.hidden_size ** 0.5
         )
 
         # BiLLM specific: track which layers should be bidirectional
@@ -207,8 +216,6 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
     def __init__(self, config: Gemma3TextConfig):
         super().__init__(config)
         self.model = Gemma3TextModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -295,7 +302,16 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
 
 class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3TextConfig):
+        try:
+            temp_num_hidden_layers = config.num_hidden_layers
+            temp_hidden_size = config.hidden_size
+            temp_vocab_size = config.vocab_size
+        except AttributeError:
+            print("Warning: config attributes not found, trying replacing config with config.get_text_config()")
+            config = config.get_text_config()
+
         super().__init__(config)
+
         self.num_labels = config.num_labels
         self.model = Gemma3TextModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
