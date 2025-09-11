@@ -185,42 +185,42 @@ i = 2
 output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Adapted from src/euroeval/finetuning.py
-training_args = TrainingArguments(
-    output_dir=output_dir,
-    eval_strategy=IntervalStrategy.STEPS,
-    save_strategy=IntervalStrategy.STEPS,
-    eval_steps=30,
-    logging_steps=30,
-    save_steps=30,
-    max_steps=10_000,  # (1 if testing)
-    report_to=[],
-    save_total_limit=1,
-    per_device_train_batch_size=args.batch_size,  # Default varies
-    per_device_eval_batch_size=args.batch_size,
-    eval_accumulation_steps=32,
-    optim=OptimizerNames.ADAMW_TORCH,
-    learning_rate=args.learning_rate,  # EuroEval default is 2e-5
-    warmup_ratio=0.01,   # 1% warmup
-    gradient_accumulation_steps=32 // args.batch_size,
-    load_best_model_at_end=True,
-    push_to_hub=args.push_to_hub,
-    hub_model_id=args.hub_model_id,
-)
+# training_args = TrainingArguments(
+#     output_dir=output_dir,
+#     eval_strategy=IntervalStrategy.STEPS,
+#     save_strategy=IntervalStrategy.STEPS,
+#     eval_steps=30,
+#     logging_steps=30,
+#     save_steps=30,
+#     max_steps=10_000,  # (1 if testing)
+#     report_to=[],
+#     save_total_limit=1,
+#     per_device_train_batch_size=args.batch_size,  # Default varies
+#     per_device_eval_batch_size=args.batch_size,
+#     eval_accumulation_steps=32,
+#     optim=OptimizerNames.ADAMW_TORCH,
+#     learning_rate=args.learning_rate,  # EuroEval default is 2e-5
+#     warmup_ratio=0.01,   # 1% warmup
+#     gradient_accumulation_steps=32 // args.batch_size,
+#     load_best_model_at_end=True,
+#     push_to_hub=args.push_to_hub,
+#     hub_model_id=args.hub_model_id,
+# )
 
 
 # Training arguments
-# training_args = TrainingArguments(
-#     output_dir=output_dir,
-#     learning_rate=args.learning_rate,
-#     per_device_train_batch_size=args.batch_size,
-#     per_device_eval_batch_size=args.batch_size,
-#     num_train_epochs=args.epochs,
-#     weight_decay=args.weight_decay,
-#     eval_strategy="epoch",
-#     save_strategy="epoch",
-#     load_best_model_at_end=True,
-#     metric_for_best_model="matthews_correlation",
-# )
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    learning_rate=args.learning_rate,
+    per_device_train_batch_size=args.batch_size,
+    per_device_eval_batch_size=args.batch_size,
+    num_train_epochs=args.epochs,
+    weight_decay=args.weight_decay,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="matthews_correlation",
+)
 
 patience = 20
 # Initialize trainer
