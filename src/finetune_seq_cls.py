@@ -253,22 +253,6 @@ eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
 print(f"Eval results: {eval_results}")
 
 """
-2dyna_ckpt_2
-Eval results: {'eval_loss': 0.7903671264648438, 'eval_accuracy': 0.498046875, 'eval_matthews_correlation': -0.007362700356183045, 'eval_f1': 0.1288135593220339, 'eval_runtime': 9.5042, 'eval_samples_per_second': 215.484, 'eval_steps_per_second': 26.935, 'epoch': 113.4375}
-
-2dyna_ckpt_3
-Eval results: {'eval_loss': 0.76373291015625, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.004259408910874128, 'eval_f1': 0.10193321616871705, 'eval_runtime': 9.7504, 'eval_samples_per_second': 210.043, 'eval_steps_per_second': 26.255, 'epoch': 61.875}
-
-Gemma 12b finetuning from BiLLM
-Eval results: {'eval_loss': 0.7579193115234375, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.003703221148025842, 'eval_f1': 0.6497601096641535, 'eval_runtime': 17.7082, 'eval_samples_per_second': 115.653, 'eval_steps_per_second': 14.457, 'epoch': 10.0}
-
-Gemma 12b finetuning adapted from EuroEval
-
-
-"""
-
-
-"""
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --dataset_name_or_path scala
 """

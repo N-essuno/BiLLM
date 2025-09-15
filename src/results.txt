@@ -1,0 +1,13 @@
+2dyna_ckpt_2 BiLLM ft
+{'eval_loss': 0.7903671264648438, 'eval_accuracy': 0.498046875, 'eval_matthews_correlation': -0.007362700356183045, 'eval_f1': 0.1288135593220339, 'eval_runtime': 9.5042, 'eval_samples_per_second': 215.484, 'eval_steps_per_second': 26.935, 'epoch': 113.4375}
+
+2dyna_ckpt_3 BiLLM ft
+{'eval_loss': 0.76373291015625, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.004259408910874128, 'eval_f1': 0.10193321616871705, 'eval_runtime': 9.7504, 'eval_samples_per_second': 210.043, 'eval_steps_per_second': 26.255, 'epoch': 61.875}
+
+2dyna EuroEval ft + eval
+{"test_mcc": -3.185725297914726, "test_mcc_se": 5.274624812329627, "test_macro_f1": 47.168457790491196, "test_macro_f1_se": 2.928961467938618}
+
+Gemma 12b BiLLM ft
+{'eval_loss': 0.7579193115234375, 'eval_accuracy': 0.5009765625, 'eval_matthews_correlation': 0.003703221148025842, 'eval_f1': 0.6497601096641535, 'eval_runtime': 17.7082, 'eval_samples_per_second': 115.653, 'eval_steps_per_second': 14.457, 'epoch': 10.0}
+
+Gemma 12b finetuning adapted from EuroEval
