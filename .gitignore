@@ -4,6 +4,8 @@ envs.env
 billm_dala_*
 billm_conll2003_*
 billm_scala_*
+billm_angry_*
+wandb/
 
 # Local models
 models
