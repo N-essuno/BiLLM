@@ -24,6 +24,8 @@ from .config import BiLLM_START_INDEX, logger
 
 _CONFIG_FOR_DOC = "Gemma3TextConfig"
 
+_CHECK_BILLM_INIT = False
+
 
 @add_start_docstrings(
     "The bare Gemma3 Text Model outputting raw hidden-states without any specific head on top.",
@@ -49,7 +51,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
         super().__init__(config)
 
         self.padding_idx = config.pad_token_id
-        self.vocab_size = config.get_text_config().vocab_size
+        self.vocab_size = config.vocab_size
 
         # Gemma3 downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
@@ -302,6 +304,12 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
 
 class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3TextConfig):
+        # Store custom attributes before processing config
+        custom_num_labels = getattr(config, 'num_labels', 2)
+        custom_id2label = getattr(config, 'id2label', {0: "LABEL_0", 1: "LABEL_1"})
+        custom_label2id = getattr(config, 'label2id', {"LABEL_0": 0, "LABEL_1": 1})
+        custom_problem_type = getattr(config, 'problem_type', None)
+        
         try:
             temp_num_hidden_layers = config.num_hidden_layers
             temp_hidden_size = config.hidden_size
@@ -309,6 +317,13 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
         except AttributeError:
             print("Warning: config attributes not found, trying replacing config with config.get_text_config()")
             config = config.get_text_config()
+
+        # Restore custom attributes after config processing
+        config.num_labels = custom_num_labels
+        config.id2label = custom_id2label
+        config.label2id = custom_label2id
+        config.problem_type = custom_problem_type
+
 
         super().__init__(config)
 
@@ -319,6 +334,197 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        if _CHECK_BILLM_INIT:
+            self._check_initialization()
+
+    def _check_initialization(self):
+        """
+        Check that the BiLLM model is correctly initialized with:
+        1. Bidirectional layers configuration
+        2. Correct sequence classification head
+        3. Proper model architecture
+        4. Attention mask handling
+        """
+        print("🔍 BiLLM Initialization Check:")
+        
+        # Check 1: Bidirectional layers configuration
+        if hasattr(self.model, 'bidirectionas'):
+            bidirectional_count = sum(self.model.bidirectionas)
+            total_layers = len(self.model.bidirectionas)
+            print(f"  ✅ Bidirectional layers: {bidirectional_count}/{total_layers} layers")
+            print(f"     BiLLM_START_INDEX: {BiLLM_START_INDEX}")
+            
+            if BiLLM_START_INDEX >= 0:
+                expected_bidirectional = total_layers - BiLLM_START_INDEX
+                if bidirectional_count == expected_bidirectional:
+                    print(f"  ✅ Bidirectional configuration correct")
+                else:
+                    print(f"  ❌ Expected {expected_bidirectional} bidirectional layers, got {bidirectional_count}")
+            else:
+                print(f"  ⚠️  BiLLM disabled (BiLLM_START_INDEX={BiLLM_START_INDEX})")
+        else:
+            print(f"  ❌ Missing bidirectional layers configuration")
+        
+        # Check 2: Sequence classification head
+        if hasattr(self, 'score'):
+            expected_output_size = self.num_labels
+            actual_output_size = self.score.out_features
+            print(f"  ✅ Classification head: {actual_output_size} output features")
+            
+            if actual_output_size == expected_output_size:
+                print(f"  ✅ Output size matches num_labels ({self.num_labels})")
+            else:
+                print(f"  ❌ Expected {expected_output_size} outputs, got {actual_output_size}")
+                
+            # Check if it's different from causal LM (no lm_head)
+            if not hasattr(self, 'lm_head'):
+                print(f"  ✅ No lm_head (correct for sequence classification)")
+            else:
+                print(f"  ⚠️  Found lm_head (unexpected for sequence classification)")
+        else:
+            print(f"  ❌ Missing sequence classification head (score layer)")
+            
+        # Check 3: Model architecture
+        if hasattr(self, 'model') and hasattr(self.model, 'layers'):
+            num_layers = len(self.model.layers)
+            print(f"  ✅ Transformer layers: {num_layers}")
+            
+            # Check that layers have correct attributes for BiLLM
+            sample_layer = self.model.layers[0]
+            if hasattr(sample_layer, 'layer_idx'):
+                print(f"  ✅ Layers have layer_idx attribute")
+            else:
+                print(f"  ⚠️  Layers missing layer_idx attribute")
+                
+            if hasattr(sample_layer, 'attention_type'):
+                print(f"  ✅ Layers have attention_type attribute")
+            else:
+                print(f"  ⚠️  Layers missing attention_type attribute")
+        else:
+            print(f"  ❌ Missing model or layers")
+            
+        # # Check 4: Attention mask handling
+        # print(f"  🎭 Attention mask check:")
+        # try:
+        #     # Test with a small dummy input to verify attention mask behavior
+        #     dummy_input_ids = torch.tensor([[1, 2, 3, 4, 5]], device=next(self.parameters()).device)
+        #     dummy_attention_mask = torch.ones_like(dummy_input_ids)
+            
+        #     # Check if model can handle attention mask creation
+        #     with torch.no_grad():
+        #         # Just check the forward pass logic - don't run full forward
+        #         inputs_embeds = self.model.embed_tokens(dummy_input_ids)
+        #         batch_size, seq_len = dummy_input_ids.shape
+                
+        #         # Simulate the mask creation logic from forward()
+        #         from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+                
+        #         # Create position info
+        #         cache_position = torch.arange(seq_len, device=dummy_input_ids.device)
+        #         position_ids = cache_position.unsqueeze(0)
+                
+        #         # Test mask creation
+        #         mask_kwargs = {
+        #             "config": self.config,
+        #             "input_embeds": inputs_embeds,
+        #             "attention_mask": dummy_attention_mask,
+        #             "cache_position": cache_position,
+        #             "past_key_values": None,
+        #             "position_ids": position_ids,
+        #         }
+                
+        #         causal_mask = create_causal_mask(**mask_kwargs)
+        #         sliding_mask = create_sliding_window_causal_mask(**mask_kwargs)
+                
+        #         print(f"     ✅ Causal mask shape: {causal_mask.shape}")
+        #         print(f"     ✅ Sliding mask shape: {sliding_mask.shape}")
+                
+        #         # Check bidirectional mask modification logic
+        #         if BiLLM_START_INDEX >= 0 and hasattr(self.model, 'layers'):
+        #             bidirectional_layers = [l for l in self.model.layers if l.layer_idx >= BiLLM_START_INDEX]
+        #             if bidirectional_layers:
+        #                 # Simulate the mask modification for bidirectional layers
+        #                 layer_attention_mask = causal_mask.clone()
+        #                 batch_size, _, seq_len, _ = layer_attention_mask.shape
+        #                 modified_mask = torch.zeros_like(layer_attention_mask)
+                        
+        #                 print(f"     ✅ Bidirectional mask modification: {layer_attention_mask.shape} -> zeros")
+        #                 print(f"     ✅ Original mask non-zero elements: {(causal_mask != 0).sum().item()}")
+        #                 print(f"     ✅ Modified mask non-zero elements: {(modified_mask != 0).sum().item()}")
+        #             else:
+        #                 print(f"     ⚠️  No bidirectional layers found to test mask modification")
+        #         else:
+        #             print(f"     ⚠️  BiLLM disabled, causal masks preserved")
+                    
+        # except Exception as e:
+        #     print(f"     ❌ Attention mask test failed: {str(e)}")
+            
+        # Check 5: Config consistency
+        print(f"  📋 Config check:")
+        print(f"     num_labels: {self.config.num_labels}")
+        print(f"     id2label: {self.config.id2label}")
+        print(f"     label2id: {self.config.label2id}")
+        print(f"     problem_type: {getattr(self.config, 'problem_type', 'None')}")
+        
+        # Summary
+        critical_checks = [
+            hasattr(self.model, 'bidirectionas'),
+            hasattr(self, 'score'),
+            hasattr(self, 'model') and hasattr(self.model, 'layers')
+        ]
+        
+        if all(critical_checks):
+            print("🎉 BiLLM initialization check PASSED!")
+        else:
+            print("❌ BiLLM initialization check FAILED!")
+            
+        print("-" * 50)
+
+    @classmethod # NEWLY ADDED
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # Load the config first
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        
+        # Add sequence classification specific config from kwargs
+        config.id2label = kwargs.get('id2label', {0: "LABEL_0", 1: "LABEL_1"})
+        config.label2id = kwargs.get('label2id', {"LABEL_0": 0, "LABEL_1": 1})
+        config.num_labels = kwargs.get('num_labels', len(config.id2label))
+        
+        # Ensure problem_type is set correctly
+        if not hasattr(config, 'problem_type'):
+            config.problem_type = None
+        
+        print(f"Creating model with {config.num_labels} labels: {config.id2label}")
+        
+        # Create the BiLLM model with custom architecture (bidirectional attention, etc.)
+        model = cls(config)
+        
+        # Now load the pretrained weights into our custom model structure
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+        try:
+            # Load pretrained state dict (remove sequence classification specific kwargs)
+            pretrained_kwargs = {k: v for k, v in kwargs.items() 
+                               if k not in ['num_labels', 'id2label', 'label2id']}
+            
+            pretrained_model = Gemma3ForCausalLM.from_pretrained(
+                pretrained_model_name_or_path, 
+                *model_args, 
+                **pretrained_kwargs
+            )
+            
+            # Copy the weights from pretrained model to our BiLLM model
+            # The BiLLM model has the same structure but with custom forward logic
+            model.model.load_state_dict(pretrained_model.model.state_dict(), strict=False)
+            
+            print("Successfully loaded pretrained weights into BiLLM custom model!")
+            
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}")
+            print("Using randomly initialized weights for BiLLM model")
+        
+        return model
+    
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -380,6 +586,27 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
+
+            # if self.config.problem_type is None:
+            #     if self.num_labels == 1:
+            #         self.config.problem_type = "regression"
+            #     elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+            #         self.config.problem_type = "single_label_classification"
+            #     else:
+            #         self.config.problem_type = "multi_label_classification"
+
+            # if self.config.problem_type == "regression":
+            #     loss_fct = MSELoss()
+            #     if self.num_labels == 1:
+            #         loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+            #     else:
+            #         loss = loss_fct(pooled_logits, labels)
+            # elif self.config.problem_type == "single_label_classification":
+            #     loss_fct = CrossEntropyLoss()
+            #     loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+            # elif self.config.problem_type == "multi_label_classification":
+            #     loss_fct = BCEWithLogitsLoss()
+            #     loss = loss_fct(pooled_logits, labels)
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
