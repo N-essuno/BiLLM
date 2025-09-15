@@ -12,8 +12,7 @@ from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback
 from transformers import DataCollatorWithPadding
 from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
-from billm import LlamaForSequenceClassification, MistralForSequenceClassification, Qwen2ForSequenceClassification, \
-    OpenELMForSequenceClassification, Gemma3ForSequenceClassification
+from billm import LlamaForSequenceClassification, MistralForSequenceClassification, Qwen2ForSequenceClassification, OpenELMForSequenceClassification, Gemma3ForSequenceClassification
 import torch
 
 from transformers.trainer_utils import IntervalStrategy
@@ -24,6 +23,9 @@ print(f"Loading envs from: {envs_dir}")
 load_dotenv(envs_dir)
 hf_token = os.getenv("HF_TOKEN")
 hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
+wandb_api_key = os.getenv("WANDB_API_KEY")
+
+os.environ["WANDB_PROJECT"] = "billm_test"
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name_or_path', type=str,
@@ -35,6 +37,7 @@ parser.add_argument('--batch_size', type=int, default=8, help='Specify number of
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='Specify learning rate, default 1e-4')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
 parser.add_argument('--max_length', type=int, default=64, help='Specify max length, default 64')
+parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Specify whether to use PEFT (LoRA), default 1 (enabled)')
 parser.add_argument('--lora_r', type=int, default=12, help='Specify lora r, default 12')
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
@@ -45,11 +48,7 @@ parser.add_argument('--hub_model_id', type=str, default=None,
 args = parser.parse_args()
 print(f'Args: {args}')
 
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, token=hf_token)
-if 'mistral' in args.model_name_or_path.lower():
-    tokenizer.add_special_tokens({'pad_token': '<unk>'})
-elif tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+
 
 # Load dataset and inspect structure
 if args.dataset_name_or_path == 'dala':
@@ -58,6 +57,9 @@ if args.dataset_name_or_path == 'dala':
 elif args.dataset_name_or_path == 'scala':
     ds = load_dataset("EuroEval/scala-da", token=hf_token_euroeval)
     label2id = {"correct": 0, "incorrect": 1}
+elif args.dataset_name_or_path == 'angry_tweets':
+    ds = load_dataset("EuroEval/angry-tweets-mini", token=hf_token_euroeval)
+    label2id = {"positive": 0, "neutral": 1, "negative": 2}
 else:
     # For custom datasets, you'll need to define label2id mapping
     ds = load_dataset(args.dataset_name_or_path)
@@ -72,6 +74,17 @@ id2label = {v: k for k, v in label2id.items()}
 num_labels = len(label2id)
 
 print(f"Detected {num_labels} labels: {label2id}")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    args.model_name_or_path, 
+    token=hf_token, 
+    num_labels=num_labels,
+    # force_download=True
+)
+if 'mistral' in args.model_name_or_path.lower():
+    tokenizer.add_special_tokens({'pad_token': '<unk>'})
+elif tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 # Initialize model based on model name
 lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -95,7 +108,8 @@ model = MODEL.from_pretrained(
     num_labels=num_labels,
     id2label=id2label,
     label2id=label2id,
-    token=hf_token
+    token=hf_token,
+    # force_download=True,
 )
 
 # Device and dtype handling
@@ -112,17 +126,25 @@ else:
     model = model.to(device)
     print("Using CPU device. bfloat16 is not used.")
 
-# Configure LoRA
-peft_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
-    inference_mode=False,
-    r=args.lora_r,
-    lora_alpha=args.lora_alpha,
-    lora_dropout=args.lora_dropout,
-    target_modules=lora_target_modules
-)
-model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
+# Configure LoRA/PEFT if enabled
+if args.use_peft:
+    print("Applying PEFT (LoRA) configuration...")
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        inference_mode=False,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=lora_target_modules
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+else:
+    print("Using full fine-tuning (no PEFT)...")
+    # For full fine-tuning, all parameters are trainable
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params:,} || All params: {total_params:,} || Trainable%: {100 * trainable_params / total_params:.2f}")
 
 
 # Fix 1: Updated preprocessing function
@@ -168,7 +190,7 @@ mcc = evaluate.load("matthews_correlation")
 f1 = evaluate.load("f1")
 
 
-# Fix 3: Updated compute_metrics function for multiclass
+# Updated compute_metrics function for multiclass
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
@@ -187,10 +209,19 @@ def compute_metrics(eval_pred):
         "f1": f1_score["f1"]
     }
 
-i = 2
-output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+i = 1
+# Include PEFT in output directory name
+peft_suffix = "peft" if args.use_peft else "full"
+output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
-# Adapted from src/euroeval/finetuning.py
+# Check if output_dir exists, if so, increment i
+while os.path.exists(output_dir):
+    i += 1
+    output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+print(f"Output directory: {output_dir}")
+
+
+# EuroStyle - Adapted from src/euroeval/finetuning.py
 training_args = TrainingArguments(
     output_dir=output_dir,
     eval_strategy=IntervalStrategy.STEPS,
@@ -199,7 +230,6 @@ training_args = TrainingArguments(
     logging_steps=30,
     save_steps=30,
     max_steps=10_000,  # (1 if testing)
-    report_to=[],
     save_total_limit=1,
     per_device_train_batch_size=args.batch_size,  # Default varies
     per_device_eval_batch_size=args.batch_size,
@@ -211,10 +241,10 @@ training_args = TrainingArguments(
     load_best_model_at_end=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
+    report_to="wandb"
 )
 
-
-# Training arguments
+# # Training arguments BiLLM like
 # training_args = TrainingArguments(
 #     output_dir=output_dir,
 #     learning_rate=args.learning_rate,
@@ -225,7 +255,9 @@ training_args = TrainingArguments(
 #     eval_strategy="epoch",
 #     save_strategy="epoch",
 #     load_best_model_at_end=True,
-#     metric_for_best_model="matthews_correlation",
+#     report_to="wandb",
+#     push_to_hub=args.push_to_hub,
+#     hub_model_id=args.hub_model_id,
 # )
 
 patience = 20
@@ -238,7 +270,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)], # EuroStyle
 )
 
 # Train the model
@@ -253,6 +285,14 @@ eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
 print(f"Eval results: {eval_results}")
 
 """
+Examples:
+# PEFT (LoRA) fine-tuning (default)
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --dataset_name_or_path scala
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets
+
+# Full fine-tuning (no PEFT)
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets --use_peft 0
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path scala --use_peft 0
 """
