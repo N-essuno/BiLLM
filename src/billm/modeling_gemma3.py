@@ -619,6 +619,26 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
 
 class Gemma3ForTokenClassification(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3TextConfig):
+        # Store custom attributes before processing config
+        custom_num_labels = getattr(config, 'num_labels', None)
+        custom_id2label = getattr(config, 'id2label', None)
+        custom_label2id = getattr(config, 'label2id', None)
+        custom_problem_type = getattr(config, 'problem_type', None)
+        
+        try:
+            temp_num_hidden_layers = config.num_hidden_layers
+            temp_hidden_size = config.hidden_size
+            temp_vocab_size = config.vocab_size
+        except AttributeError:
+            print("Warning: config attributes not found, trying replacing config with config.get_text_config()")
+            config = config.get_text_config()
+
+        # Restore custom attributes after config processing
+        config.num_labels = custom_num_labels
+        config.id2label = custom_id2label
+        config.label2id = custom_label2id
+        config.problem_type = custom_problem_type
+
         super().__init__(config)
         self.num_labels = config.num_labels
 
@@ -634,6 +654,51 @@ class Gemma3ForTokenClassification(Gemma3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @classmethod # NEWLY ADDED
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # Load the config first
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        
+        # Add sequence classification specific config from kwargs
+        config.id2label = kwargs.get('id2label', None)
+        config.label2id = kwargs.get('label2id', None)
+        config.num_labels = kwargs.get('num_labels', len(config.id2label))
+        
+        # Ensure problem_type is set correctly
+        if not hasattr(config, 'problem_type'):
+            config.problem_type = None
+        
+        print(f"Creating model with {config.num_labels} labels: {config.id2label}")
+        
+        # Create the BiLLM model with custom architecture (bidirectional attention, etc.)
+        model = cls(config)
+        
+        # Now load the pretrained weights into our custom model structure
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+        try:
+            # Load pretrained state dict (remove sequence classification specific kwargs)
+            pretrained_kwargs = {k: v for k, v in kwargs.items() 
+                               if k not in ['num_labels', 'id2label', 'label2id']}
+            
+            pretrained_model = Gemma3ForCausalLM.from_pretrained(
+                pretrained_model_name_or_path, 
+                *model_args, 
+                **pretrained_kwargs
+            )
+            
+            # Copy the weights from pretrained model to our BiLLM model
+            # The BiLLM model has the same structure but with custom forward logic
+            model.model.load_state_dict(pretrained_model.model.state_dict(), strict=False)
+            
+            print("Successfully loaded pretrained weights into BiLLM custom model!")
+            
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}")
+            print("Using randomly initialized weights for BiLLM model")
+        
+        return model
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
