@@ -293,6 +293,5 @@ python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets
 
 # Full fine-tuning (no PEFT)
-python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets --use_peft 0
-python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path scala --use_peft 0
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0
 """
