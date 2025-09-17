@@ -8,7 +8,7 @@ import argparse
 import numpy as np
 import evaluate
 from datasets import load_dataset
-from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback
+from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, TrainerCallback
 from transformers import DataCollatorWithPadding
 from transformers import TrainingArguments, Trainer
 from peft import get_peft_model, LoraConfig, TaskType
@@ -33,12 +33,13 @@ parser.add_argument('--model_name_or_path', type=str,
 parser.add_argument('--dataset_name_or_path', type=str, default='dala',
                     help='Specify huggingface dataset name or local file path. Default is dala.')
 parser.add_argument('--epochs', type=int, default=10, help='Specify number of epochs, default 10')
-parser.add_argument('--batch_size', type=int, default=8, help='Specify number of batch size, default 8')
-parser.add_argument('--learning_rate', type=float, default=1e-4, help='Specify learning rate, default 1e-4')
+parser.add_argument('--batch_size', type=int, default=128, help='Specify number of batch size, default 128') # 128 instead of 8
+parser.add_argument('--learning_rate', type=float, default=1e-5, help='Specify learning rate, default 1e-5') # 1e-5 instead of 1e-4
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Specify gradient accumulation steps, default 1')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
-parser.add_argument('--max_length', type=int, default=64, help='Specify max length, default 64')
+parser.add_argument('--max_length', type=int, default=2048, help='Specify max length, default 2048') # 2048 instead of 64
 parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Specify whether to use PEFT (LoRA), default 1 (enabled)')
-parser.add_argument('--lora_r', type=int, default=12, help='Specify lora r, default 12')
+parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16') # 16 instead of 12
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
 # configure hub
@@ -48,6 +49,44 @@ parser.add_argument('--hub_model_id', type=str, default=None,
 args = parser.parse_args()
 print(f'Args: {args}')
 
+class BestMetricsLoggerCallback(TrainerCallback):
+    def __init__(self):
+        # {metric_name: (best_value, full_metrics_dict)}
+        self.best_metrics = {}
+        self.metric_keywords = [
+            "precision", "recall", "matthews_correlation", "mcc", "accuracy", "loss"
+        ]
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        for metric, value in metrics.items():
+            # Only track metrics containing specified keywords and are float/int
+            if (
+                isinstance(value, (float, int)) and
+                any(keyword in metric.lower() for keyword in self.metric_keywords)
+            ):
+                # For loss, lower is better; for others, higher is better
+                if "loss" in metric.lower():
+                    is_better = (metric not in self.best_metrics) or (value < self.best_metrics[metric][0])
+                else:
+                    is_better = (metric not in self.best_metrics) or (value > self.best_metrics[metric][0])
+                if is_better:
+                    self.best_metrics[metric] = (value, metrics.copy())
+
+    def on_train_end(self, args, state, control, **kwargs):
+        print("\n========== BEST METRICS SUMMARY ==========")
+        for metric, (best_value, metrics_dict) in self.best_metrics.items():
+            print(f"\nBest {metric}: {best_value:.4f}")
+            print("Related metrics for this run:")
+            for k, v in metrics_dict.items():
+                if (
+                    isinstance(v, (float, int)) and
+                    any(keyword in k.lower() for keyword in self.metric_keywords)
+                ):
+                    print(f"  {k}: {v:.4f}")
+                elif any(keyword in k.lower() for keyword in self.metric_keywords):
+                    print(f"  {k}: {v}")
 
 
 # Load dataset and inspect structure
@@ -181,6 +220,74 @@ def preprocess_function(examples):
 # Tokenize datasets and remove original columns that might interfere
 tokenized_ds = ds.map(preprocess_function, batched=True, remove_columns=ds["train"].column_names)
 
+# Analyze token distribution and memory requirements
+def analyze_token_distribution(dataset, dataset_name="train"):
+    """Analyze token count distribution in the dataset"""
+    token_counts = [len(example['input_ids']) for example in dataset]
+    
+    print(f"\n{'='*60}")
+    print(f"TOKEN ANALYSIS FOR {dataset_name.upper()} SET")
+    print(f"{'='*60}")
+    print(f"Total examples: {len(token_counts):,}")
+    print(f"Min tokens per example: {min(token_counts)}")
+    print(f"Max tokens per example: {max(token_counts)}")
+    print(f"Average tokens per example: {np.mean(token_counts):.1f}")
+    print(f"Median tokens per example: {np.median(token_counts):.1f}")
+    print(f"Token count standard deviation: {np.std(token_counts):.1f}")
+    
+    # Percentile analysis
+    percentiles = [50, 75, 90, 95, 99]
+    print(f"\nToken count percentiles:")
+    for p in percentiles:
+        print(f"  {p}th percentile: {np.percentile(token_counts, p):.0f} tokens")
+    
+    # Memory estimation
+    batch_size = args.batch_size
+    print(f"\n{'='*60}")
+    print(f"MEMORY ESTIMATION (per device)")
+    print(f"{'='*60}")
+    print(f"Batch size: {batch_size}")
+    print(f"Max sequence length: {args.max_length}")
+    
+    # Calculate tokens per batch scenarios
+    avg_tokens_per_batch = batch_size * np.mean(token_counts)
+    max_tokens_per_batch = batch_size * args.max_length  # Worst case with padding
+    
+    print(f"\nTokens per batch scenarios:")
+    print(f"  Average case: {avg_tokens_per_batch:,.0f} tokens per batch")
+    print(f"  Worst case (max padding): {max_tokens_per_batch:,.0f} tokens per batch")
+    
+    # Check if gradient accumulation is used
+    if args.gradient_accumulation_steps is not None:
+        grad_accum_steps = args.gradient_accumulation_steps
+        print(f"  Gradient accumulation steps: {grad_accum_steps}")
+        print(f"  Effective batch size: {batch_size * grad_accum_steps}")
+        print(f"  Total tokens per gradient update (avg): {avg_tokens_per_batch * grad_accum_steps:,.0f}")
+        print(f"  Total tokens per gradient update (max): {max_tokens_per_batch * grad_accum_steps:,.0f}")
+    
+    # Model parameter estimation (rough)
+    total_params = sum(p.numel() for p in model.parameters())
+    if args.use_peft:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\nModel parameters (LoRA):")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
+        print(f"  Trainable percentage: {100 * trainable_params / total_params:.2f}%")
+    else:
+        print(f"\nModel parameters (Full fine-tuning):")
+        print(f"  Total trainable parameters: {total_params:,}")
+    
+    print(f"\n{'='*60}")
+    return token_counts
+
+# Analyze train and validation sets
+# print("Analyzing token distribution...")
+# train_token_counts = analyze_token_distribution(tokenized_ds["train"], "train")
+# if "validation" in tokenized_ds:
+#     val_token_counts = analyze_token_distribution(tokenized_ds["validation"], "validation")
+# elif "test" in tokenized_ds:
+#     test_token_counts = analyze_token_distribution(tokenized_ds["test"], "test")
+
 # Data collator for padding
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
 
@@ -237,11 +344,12 @@ training_args = TrainingArguments(
     optim=OptimizerNames.ADAMW_TORCH,
     learning_rate=args.learning_rate,  # EuroEval default is 2e-5
     warmup_ratio=0.01,   # 1% warmup
-    gradient_accumulation_steps=32 // args.batch_size,
+    gradient_accumulation_steps= args.gradient_accumulation_steps,
     load_best_model_at_end=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
-    report_to="wandb"
+    # report_to="wandb",
+    # metric_for_best_model="matthews_correlation",
 )
 
 # # Training arguments BiLLM like
@@ -270,7 +378,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)], # EuroStyle
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()], # EuroStyle
 )
 
 # Train the model
@@ -282,7 +390,19 @@ if args.push_to_hub:
 
 # Evaluate the model
 eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
-print(f"Eval results: {eval_results}")
+
+
+# Print training arguments and evaluation results
+print(f"Training arguments: {training_args}")
+print("=" * 60)
+print(f"Test results: {eval_results}")
+
+
+
+
+
+
+
 
 """
 Examples:
@@ -291,6 +411,8 @@ python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --dataset_name_or_path scala
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets
+
 
 # Full fine-tuning (no PEFT)
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0
