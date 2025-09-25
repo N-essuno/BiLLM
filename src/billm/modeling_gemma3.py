@@ -304,6 +304,8 @@ class Gemma3ForCausalLM(Gemma3PreTrainedModel, GenerationMixin):
 
 class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
     def __init__(self, config: Gemma3TextConfig):
+        self._PRINT_LOSS_TYPE = True
+
         # Store custom attributes before processing config
         custom_num_labels = getattr(config, 'num_labels', 2)
         custom_id2label = getattr(config, 'id2label', {0: "LABEL_0", 1: "LABEL_1"})
@@ -596,15 +598,24 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
             #         self.config.problem_type = "multi_label_classification"
 
             # if self.config.problem_type == "regression":
+            #     if self._PRINT_LOSS_TYPE:
+            #         print("Using MSELoss for regression")
+            #         self._PRINT_LOSS_TYPE = False
             #     loss_fct = MSELoss()
             #     if self.num_labels == 1:
             #         loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
             #     else:
             #         loss = loss_fct(pooled_logits, labels)
             # elif self.config.problem_type == "single_label_classification":
+            #     if self._PRINT_LOSS_TYPE:
+            #         print("Using CrossEntropyLoss for single_label_classification")
+            #         self._PRINT_LOSS_TYPE = False
             #     loss_fct = CrossEntropyLoss()
             #     loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             # elif self.config.problem_type == "multi_label_classification":
+            #     if self._PRINT_LOSS_TYPE:
+            #         print("Using BCEWithLogitsLoss for multi_label_classification")
+            #         self._PRINT_LOSS_TYPE = False
             #     loss_fct = BCEWithLogitsLoss()
             #     loss = loss_fct(pooled_logits, labels)
 
