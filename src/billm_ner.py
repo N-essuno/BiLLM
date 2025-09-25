@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 import evaluate
 from datasets import load_dataset
-from transformers import AutoTokenizer, EarlyStoppingCallback
+from transformers import AutoTokenizer, EarlyStoppingCallback, TrainerCallback
 from transformers.trainer_utils import IntervalStrategy
 from transformers.training_args import OptimizerNames, TrainingArguments
 from transformers import DataCollatorForTokenClassification
@@ -16,15 +16,22 @@ from billm import LlamaForTokenClassification, MistralForTokenClassification, Ge
 from dotenv import load_dotenv
 import os
 import torch
+import wandb
 
 envs_dir = os.getcwd() + '/envs.env'
 print(f"Loading envs from: {envs_dir}")
 load_dotenv(envs_dir)
+
+# Set memory optimization flags
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 hf_token = os.getenv("HF_TOKEN")
 hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
 wandb_api_key = os.getenv("WANDB_API_KEY")
 
 os.environ["WANDB_PROJECT"] = "billm_test"
+
+print(hf_token_euroeval)
 
 
 parser = argparse.ArgumentParser()
@@ -33,20 +40,69 @@ parser.add_argument('--model_name_or_path', type=str, default='NousResearch/Llam
 parser.add_argument('--dataset_name_or_path', type=str, default='conll2003',
                     help='Specify huggingface dataset name or local file path. Default is conll2003.')
 parser.add_argument('--epochs', type=int, default=10, help='Specify number of epochs, default 10')
-parser.add_argument('--batch_size', type=int, default=8, help='Specify number of batch size, default 8')
-parser.add_argument('--learning_rate', type=float, default=1e-4, help='Specify learning rate, default 1e-4')
+parser.add_argument('--batch_size', type=int, default=128, help='Specify number of batch size, default 128') # 128 instead of 8
+parser.add_argument('--learning_rate', type=float, default=1e-5, help='Specify learning rate, default 1e-5') # 1e-5 instead of 1e-4
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Specify gradient accumulation steps, default 1')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
-parser.add_argument('--max_length', type=int, default=64, help='Specify max length, default 64')
+parser.add_argument('--max_length', type=int, default=2048, help='Specify max length, default 2048') # 2048 instead of 64
 parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Specify whether to use PEFT (LoRA), default 1 (enabled)')
-parser.add_argument('--lora_r', type=int, default=32, help='Specify lora r, default 32')
+parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16') # 16 instead of 32
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
 # configure hub
 parser.add_argument('--push_to_hub', type=int, default=0, choices=[0, 1], help='Specify push_to_hub, default 0')
 parser.add_argument('--hub_model_id', type=str, default=None,
                     help='Specify push_to_hub_model_id, default None, format like organization/model_id')
+# configure device
+parser.add_argument('--gpu_device', type=int, default=None,
+                    help='Specify which GPU device to use (0, 1, 2, etc.). If not specified, uses default CUDA device or auto-selects.')
 args = parser.parse_args()
+
+# Set CUDA device as early as possible if specified
+if args.gpu_device is not None:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_device)
+    print(f"Set CUDA_VISIBLE_DEVICES to: {args.gpu_device}")
+
 print(f'Args: {args}')
+
+class BestMetricsLoggerCallback(TrainerCallback):
+    def __init__(self):
+        # {metric_name: (best_value, full_metrics_dict)}
+        self.best_metrics = {}
+        self.metric_keywords = [
+            "precision", "recall", "matthews_correlation", "mcc", "accuracy", "loss", "f1"
+        ]
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        for metric, value in metrics.items():
+            # Only track metrics containing specified keywords and are float/int
+            if (
+                isinstance(value, (float, int)) and
+                any(keyword in metric.lower() for keyword in self.metric_keywords)
+            ):
+                # For loss, lower is better; for others, higher is better
+                if "loss" in metric.lower():
+                    is_better = (metric not in self.best_metrics) or (value < self.best_metrics[metric][0])
+                else:
+                    is_better = (metric not in self.best_metrics) or (value > self.best_metrics[metric][0])
+                if is_better:
+                    self.best_metrics[metric] = (value, metrics.copy())
+
+    def on_train_end(self, args, state, control, **kwargs):
+        print("\n========== BEST METRICS SUMMARY ==========")
+        for metric, (best_value, metrics_dict) in self.best_metrics.items():
+            print(f"\nBest {metric}: {best_value:.4f}")
+            print("Related metrics for this run:")
+            for k, v in metrics_dict.items():
+                if (
+                    isinstance(v, (float, int)) and
+                    any(keyword in k.lower() for keyword in self.metric_keywords)
+                ):
+                    print(f"  {k}: {v:.4f}")
+                elif any(keyword in k.lower() for keyword in self.metric_keywords):
+                    print(f"  {k}: {v}")
 
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, token=hf_token)
@@ -55,7 +111,6 @@ if 'mistral' in args.model_name_or_path.lower():
 elif tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-seqeval = evaluate.load("seqeval")
 if args.dataset_name_or_path == 'wnut_17':
     ds = load_dataset("wnut_17")
     label2id = {"O": 0, "B-corporation": 1, "I-corporation": 2, "B-creative-work": 3, "I-creative-work": 4, "B-group": 5, "I-group": 6, "B-location": 7, "I-location": 8, "B-person": 9, "I-person": 10, "B-product": 11, "I-product": 12, }
@@ -92,15 +147,32 @@ model = MODEL.from_pretrained(
 )
 
 # Device and dtype handling
-if torch.backends.mps.is_available():
+# Clear CUDA cache to avoid memory issues from previous runs
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+if torch.backends.mps.is_available() and args.gpu_device is None:
     device = torch.device("mps")
     model = model.to(device)
     print("Using MPS device. bfloat16 is not supported, using default dtype.")
 elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    model = model.to(device).bfloat16()
-    print("Using CUDA device with bfloat16.")
+    if args.gpu_device is not None:
+        # When CUDA_VISIBLE_DEVICES is set, PyTorch sees only the specified GPU as device 0
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            raise ValueError(f"GPU device {args.gpu_device} not available or CUDA not accessible")
+        device = torch.device("cuda:0")  # Always use device 0 since CUDA_VISIBLE_DEVICES isolates the GPU
+        # Ensure we're using the correct device
+        with torch.cuda.device(0):
+            model = model.to(device).bfloat16()
+        print(f"Using CUDA device {args.gpu_device} (mapped to cuda:0): {torch.cuda.get_device_name(0)} with bfloat16.")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+    else:
+        device = torch.device("cuda")
+        model = model.to(device).bfloat16()
+        print(f"Using default CUDA device: {torch.cuda.get_device_name()} with bfloat16.")
 else:
+    if args.gpu_device is not None:
+        print(f"Warning: GPU device {args.gpu_device} specified but CUDA not available. Using CPU.")
     device = torch.device("cpu")
     model = model.to(device)
     print("Using CPU device. bfloat16 is not used.")
@@ -178,7 +250,7 @@ def remove_misc(predictions, labels):
     
     return filtered_predictions, filtered_labels
 
-
+seqeval = evaluate.load("seqeval")
 def compute_metrics(p):
     predictions, labels = p
     predictions = np.argmax(predictions, axis=2)
@@ -210,16 +282,21 @@ def compute_metrics(p):
 tokenized_ds = ds.map(tokenize_and_align_labels, batched=True)
 data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
 
+model_name = args.model_name_or_path.split("/")[-1]
+
 i = 1
 # Include PEFT in output directory name
-peft_suffix = "peft" if args.use_peft else "full"
-output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_ckpt".replace('.', '').replace('_-', '_').replace('-_', '_')
+peft_suffix = "lora" if args.use_peft else "full"
+output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Check if output_dir exists, if so, increment i
 while os.path.exists(output_dir):
     i += 1
-    output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+
 print(f"Output directory: {output_dir}")
+
+wandb.init(name=output_dir)
 
 
 # EuroStyle - Adapted from src/euroeval/finetuning.py
@@ -238,28 +315,14 @@ training_args = TrainingArguments(
     optim=OptimizerNames.ADAMW_TORCH,
     learning_rate=args.learning_rate,  # EuroEval default is 2e-5
     warmup_ratio=0.01,   # 1% warmup
-    gradient_accumulation_steps=32 // args.batch_size,
+    gradient_accumulation_steps=args.gradient_accumulation_steps, # instead of 32 // args.batch_size
+    # gradient_checkpointing=True,  # Trade compute for memory
+    # dataloader_pin_memory=False,  # Reduce memory usage
     load_best_model_at_end=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
     report_to="wandb"
 )
-
-# # Training arguments BiLLM like
-# training_args = TrainingArguments(
-#     output_dir=output_dir,
-#     learning_rate=args.learning_rate,
-#     per_device_train_batch_size=args.batch_size,
-#     per_device_eval_batch_size=args.batch_size,
-#     num_train_epochs=args.epochs,
-#     weight_decay=args.weight_decay,
-#     eval_strategy="epoch",
-#     save_strategy="epoch",
-#     load_best_model_at_end=True,
-#     push_to_hub=args.push_to_hub,
-#     hub_model_id=args.hub_model_id,
-#     report_to="wandb",
-# )
 
 patience = 20
 # Initialize trainer
@@ -271,14 +334,24 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)], # EuroStyle
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()], # EuroStyle
 )
+
+# Clear cache before training
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
 trainer.train()
 
 # Evaluate the model
 eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
-print(f"Eval results on test set: {eval_results}")
+
+
+# Print training arguments and evaluation results
+print(f"Training arguments: {training_args}")
+print("=" * 60)
+print(f"Test results: {eval_results}")
 
 # push the best model to the hub
 if args.push_to_hub:
@@ -290,5 +363,29 @@ if args.push_to_hub:
 python src/billm_ner.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path dansk
 python src/billm_ner.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path dansk
 python src/billm_ner.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path dansk --use_peft 0
+
+----
+
+Latest runs
+
+python src/billm_ner.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 
+
+python src/billm_ner.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 
+
+python src/billm_ner.py --model_name_or_path google/gemma-3-1b-it --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 
+
+python src/billm_ner.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 
+
+python src/billm_ner.py --model_name_or_path google/gemma-3-4b-it --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 
+
+python src/billm_ner.py --model_name_or_path ../new_models/student_step3678_onpolicy --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 1
+
+python src/billm_ner.py --model_name_or_path ../new_models/student_step15908_dyna_none --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 1
+
+python src/billm_ner.py --model_name_or_path ../new_models/student_step7356_cos_giga_distill_full --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 0
+
+to run
+
+python src/billm_ner.py --model_name_or_path ../new_models/student_step24125_dyna_commonpile --dataset_name_or_path dansk --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 0
 
 """

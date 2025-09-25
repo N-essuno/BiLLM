@@ -196,6 +196,8 @@ if args.dataset_name_or_path == "danske_talemaader":
     dataset = load_dataset("EuroEval/danske-talemaader", token=hf_token_euroeval)
 elif args.dataset_name_or_path == "danish_citizen_test":
     dataset = load_dataset("EuroEval/danish-citizen-tests-updated", token=hf_token_euroeval)
+elif args.dataset_name_or_path == "hellaswag_da":
+    dataset = load_dataset("EuroEval/hellaswag-da-mini", token=hf_token_euroeval)
 else:
     dataset = load_dataset(args.dataset_name_or_path)
 
@@ -526,7 +528,26 @@ python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/stude
 
 python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step24125_dyna_commonpile --dataset_name_or_path danske_talemaader --use_peft 0 --gpu_device 0
 
+python src/finetune_multi_choice_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path hellaswag_da --use_peft 0 --batch_size 8 --gradient_accumulation_steps 16 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path google/gemma-3-4b-it --dataset_name_or_path hellaswag_da --use_peft 0 --batch_size 8 --gradient_accumulation_steps 16 --gpu_device 0
+
+
 to run:
+
+python src/finetune_multi_choice_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path google/gemma-3-1b-it --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step15908_dyna_none --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step3678_onpolicy --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step7356_cos_giga_distill_full --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
+
+python src/finetune_multi_choice_cls.py --model_name_or_path ../new_models/student_step24125_dyna_commonpile --dataset_name_or_path hellaswag_da --use_peft 0 --gpu_device 0
 
 
 
