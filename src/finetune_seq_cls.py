@@ -5,28 +5,7 @@ import os
 
 import argparse
 
-import numpy as np
-import evaluate
-from datasets import load_dataset
-from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, TrainerCallback
-from transformers import DataCollatorWithPadding
-from transformers import TrainingArguments, Trainer
-from peft import get_peft_model, LoraConfig, TaskType
-from billm import LlamaForSequenceClassification, MistralForSequenceClassification, Qwen2ForSequenceClassification, OpenELMForSequenceClassification, Gemma3ForSequenceClassification
-import torch
-
-from transformers.trainer_utils import IntervalStrategy
-from transformers.training_args import OptimizerNames, TrainingArguments
-
-envs_dir = os.getcwd() + '/envs.env'
-print(f"Loading envs from: {envs_dir}")
-load_dotenv(envs_dir)
-hf_token = os.getenv("HF_TOKEN")
-hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
-wandb_api_key = os.getenv("WANDB_API_KEY")
-
-os.environ["WANDB_PROJECT"] = "billm_test"
-
+# Parse arguments first to set GPU device early
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name_or_path', type=str,
                     help='Specify model_name_or_path to set transformer backbone.')
@@ -46,7 +25,38 @@ parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lor
 parser.add_argument('--push_to_hub', type=int, default=0, choices=[0, 1], help='Specify push_to_hub, default 0')
 parser.add_argument('--hub_model_id', type=str, default=None,
                     help='Specify push_to_hub_model_id, default None, format like organization/model_id')
+# configure device
+parser.add_argument('--gpu_device', type=int, default=None,
+                    help='Specify which GPU device to use (0, 1, 2, etc.). If not specified, uses default CUDA device or auto-selects.')
 args = parser.parse_args()
+
+# Set CUDA device as early as possible if specified
+if args.gpu_device is not None:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_device)
+    print(f"Set CUDA_VISIBLE_DEVICES to: {args.gpu_device}")
+
+import numpy as np
+import evaluate
+from datasets import load_dataset
+from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, TrainerCallback
+from transformers import DataCollatorWithPadding
+from transformers import TrainingArguments, Trainer
+from transformers.trainer_utils import IntervalStrategy
+from transformers.training_args import OptimizerNames
+from peft import get_peft_model, LoraConfig, TaskType
+import wandb
+from billm import LlamaForSequenceClassification, MistralForSequenceClassification, Qwen2ForSequenceClassification, OpenELMForSequenceClassification, Gemma3ForSequenceClassification
+import torch
+
+envs_dir = os.getcwd() + '/envs.env'
+print(f"Loading envs from: {envs_dir}")
+load_dotenv(envs_dir)
+hf_token = os.getenv("HF_TOKEN")
+hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
+wandb_api_key = os.getenv("WANDB_API_KEY")
+
+os.environ["WANDB_PROJECT"] = "billm_test"
+
 print(f'Args: {args}')
 
 class BestMetricsLoggerCallback(TrainerCallback):
@@ -54,7 +64,7 @@ class BestMetricsLoggerCallback(TrainerCallback):
         # {metric_name: (best_value, full_metrics_dict)}
         self.best_metrics = {}
         self.metric_keywords = [
-            "precision", "recall", "matthews_correlation", "mcc", "accuracy", "loss"
+            "precision", "recall", "matthews_correlation", "mcc", "accuracy", "loss", "f1"
         ]
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
@@ -152,15 +162,32 @@ model = MODEL.from_pretrained(
 )
 
 # Device and dtype handling
-if torch.backends.mps.is_available():
+# Clear CUDA cache to avoid memory issues from previous runs
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+if torch.backends.mps.is_available() and args.gpu_device is None:
     device = torch.device("mps")
     model = model.to(device)
     print("Using MPS device. bfloat16 is not supported, using default dtype.")
 elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    model = model.to(device).bfloat16()
-    print("Using CUDA device with bfloat16.")
+    if args.gpu_device is not None:
+        # When CUDA_VISIBLE_DEVICES is set, PyTorch sees only the specified GPU as device 0
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            raise ValueError(f"GPU device {args.gpu_device} not available or CUDA not accessible")
+        device = torch.device("cuda:0")  # Always use device 0 since CUDA_VISIBLE_DEVICES isolates the GPU
+        # Ensure we're using the correct device
+        with torch.cuda.device(0):
+            model = model.to(device).bfloat16()
+        print(f"Using CUDA device {args.gpu_device} (mapped to cuda:0): {torch.cuda.get_device_name(0)} with bfloat16.")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+    else:
+        device = torch.device("cuda")
+        model = model.to(device).bfloat16()
+        print(f"Using default CUDA device: {torch.cuda.get_device_name()} with bfloat16.")
 else:
+    if args.gpu_device is not None:
+        print(f"Warning: GPU device {args.gpu_device} specified but CUDA not available. Using CPU.")
     device = torch.device("cpu")
     model = model.to(device)
     print("Using CPU device. bfloat16 is not used.")
@@ -316,17 +343,23 @@ def compute_metrics(eval_pred):
         "f1": f1_score["f1"]
     }
 
+model_name = args.model_name_or_path.split("/")[-1]
+
+actual_batch_size = args.batch_size * args.gradient_accumulation_steps
+
 i = 1
 # Include PEFT in output directory name
-peft_suffix = "peft" if args.use_peft else "full"
-output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+peft_suffix = "lora" if args.use_peft else "full"
+output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Check if output_dir exists, if so, increment i
 while os.path.exists(output_dir):
     i += 1
-    output_dir = f"billm_{args.dataset_name_or_path.replace('/', '-')}_{args.model_name_or_path.replace('/', '-')}_{peft_suffix}_ckpt_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+
 print(f"Output directory: {output_dir}")
 
+wandb.init(name=output_dir)
 
 # EuroStyle - Adapted from src/euroeval/finetuning.py
 training_args = TrainingArguments(
@@ -348,25 +381,8 @@ training_args = TrainingArguments(
     load_best_model_at_end=True,
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
-    # report_to="wandb",
-    # metric_for_best_model="matthews_correlation",
+    report_to="wandb",
 )
-
-# # Training arguments BiLLM like
-# training_args = TrainingArguments(
-#     output_dir=output_dir,
-#     learning_rate=args.learning_rate,
-#     per_device_train_batch_size=args.batch_size,
-#     per_device_eval_batch_size=args.batch_size,
-#     num_train_epochs=args.epochs,
-#     weight_decay=args.weight_decay,
-#     eval_strategy="epoch",
-#     save_strategy="epoch",
-#     load_best_model_at_end=True,
-#     report_to="wandb",
-#     push_to_hub=args.push_to_hub,
-#     hub_model_id=args.hub_model_id,
-# )
 
 patience = 20
 # Initialize trainer
@@ -378,7 +394,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()], # EuroStyle
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()],
 )
 
 # Train the model
@@ -401,9 +417,6 @@ print(f"Test results: {eval_results}")
 
 
 
-
-
-
 """
 Examples:
 # PEFT (LoRA) fine-tuning (default)
@@ -416,4 +429,41 @@ python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31
 
 # Full fine-tuning (no PEFT)
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0
+
+Latest runs
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path angry_tweets --use_peft 0
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --batch_size 8 --gradient_accumulation_steps 16
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-it --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 1 --batch_size 8 --gradient_accumulation_steps 16
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-it --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step3678_onpolicy --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step7356_cos_giga_distill_full --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step15908_dyna_none --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step24125_dyna_commonpile --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path scala --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-it --dataset_name_or_path scala --use_peft 0 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path scala --use_peft 0 --batch_size 8 --gradient_accumulation_steps 16 --gpu_device 0
+
+to run
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-it --dataset_name_or_path scala --use_peft 0 --batch_size 8 --gradient_accumulation_steps 16 --gpu_device 0
+
+
+tests
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 0
+
+
 """
