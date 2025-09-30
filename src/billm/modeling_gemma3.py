@@ -583,7 +583,7 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
             )
 
-        pooled_hidden_states = hidden_states[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+        pooled_hidden_states = hidden_states[torch.arange(batch_size, device=hidden_states.device), last_non_pad_token]
 
         pooled_logits = self.score(pooled_hidden_states)
 
