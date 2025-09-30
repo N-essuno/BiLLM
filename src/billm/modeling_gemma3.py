@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss, BCEWithLogitsLoss
 from transformers import add_start_docstrings, StaticCache, DynamicCache, Cache, Gemma3TextConfig, GenerationMixin
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast, QuestionAnsweringModelOutput
 from transformers.models.gemma3.modeling_gemma3 import Gemma3DecoderLayer, Gemma3RMSNorm, Gemma3TextScaledWordEmbedding, Gemma3RotaryEmbedding
 from transformers.utils import add_start_docstrings_to_model_forward, replace_return_docstrings
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -756,6 +756,128 @@ class Gemma3ForTokenClassification(Gemma3PreTrainedModel):
         return TokenClassifierOutput(
             loss=loss,
             logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+class Gemma3ForQuestionAnswering(Gemma3PreTrainedModel):
+    """Gemma3 model for Question Answering - adapted from EuroEval's approach."""
+    
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # Store custom attributes before processing config
+        try:
+            temp_num_hidden_layers = config.num_hidden_layers
+            temp_hidden_size = config.hidden_size
+            temp_vocab_size = config.vocab_size
+        except AttributeError:
+            print("Warning: config attributes not found, trying replacing config with config.get_text_config()")
+            config = config.get_text_config()
+        
+        self.model = Gemma3TextModel(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)  # start and end positions
+        
+        # Initialize weights and apply final processing
+        self.post_init()
+    
+    @classmethod # NEWLY ADDED
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # Load the config first
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+    
+        # Create the BiLLM model with custom architecture (bidirectional attention, etc.)
+        model = cls(config)
+        
+        # Now load the pretrained weights into our custom model structure
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
+        try:
+            # Load pretrained state dict (remove sequence classification specific kwargs)
+            pretrained_kwargs = {k: v for k, v in kwargs.items() 
+                               if k not in ['num_labels', 'id2label', 'label2id']}
+            
+            pretrained_model = Gemma3ForCausalLM.from_pretrained(
+                pretrained_model_name_or_path, 
+                *model_args, 
+                **pretrained_kwargs
+            )
+            
+            # Copy the weights from pretrained model to our BiLLM model
+            # The BiLLM model has the same structure but with custom forward logic
+            model.model.load_state_dict(pretrained_model.model.state_dict(), strict=False)
+            
+            print("Successfully loaded pretrained weights into BiLLM custom model!")
+            
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}")
+            print("Using randomly initialized weights for BiLLM model")
+        
+        return model
+    
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        end_positions: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> QuestionAnsweringModelOutput:
+        
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        
+        sequence_output = outputs.last_hidden_state
+        logits = self.qa_outputs(sequence_output)
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+        
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            if len(start_positions.size()) > 1:
+                start_positions = start_positions.squeeze(-1).contiguous()
+            if len(end_positions.size()) > 1:
+                end_positions = end_positions.squeeze(-1).contiguous()
+                
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
+
+            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+
+        return QuestionAnsweringModelOutput(
+            loss=total_loss,
+            start_logits=start_logits,
+            end_logits=end_logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
