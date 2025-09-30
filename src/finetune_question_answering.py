@@ -5,14 +5,15 @@ import argparse
 import torch
 import torch.nn as nn
 import numpy as np
-import evaluate
+# import evaluate  # Not needed - using custom metrics
 import wandb
 from dotenv import load_dotenv
 from datasets import load_dataset, DatasetDict
 from transformers import (
     AutoConfig, 
     AutoTokenizer, 
-    EarlyStoppingCallback, 
+    EarlyStoppingCallback,
+    PreTrainedModel, 
     TrainerCallback,
     DataCollatorWithPadding,
     TrainingArguments, 
@@ -22,10 +23,76 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import IntervalStrategy, EvalPrediction
 from transformers.training_args import OptimizerNames
 from peft import get_peft_model, LoraConfig, TaskType
-from billm import Gemma3ForTokenClassification
+from billm import Gemma3ForQuestionAnswering
+from torch.nn import CrossEntropyLoss
 from collections import defaultdict
 import json
 from typing import Dict, List, Tuple, Optional, Any
+from datasets.arrow_dataset import Dataset
+
+# NEW
+def setup_model_for_question_answering(model: Gemma3ForQuestionAnswering) -> Gemma3ForQuestionAnswering:
+    """Setup a model for question answering - adapted from EuroEval."""
+    # Get the models' token type embedding children, if they exist
+    children = get_children_of_module(name="model", module=model)
+    
+    if children and isinstance(children, dict):
+        # Get the list of attributes that are token type embeddings
+        attribute_list = list()
+        done = False
+        while not done:
+            for key, value in children.items():
+                attribute_list.append(key)
+                if isinstance(value, dict):
+                    children = value
+                else:
+                    done = True
+                break
+
+        # Get the token type embeddings if they exist
+        if attribute_list:
+            try:
+                token_type_embeddings = model
+                for attribute in attribute_list:
+                    token_type_embeddings = getattr(token_type_embeddings, attribute)
+                
+                if hasattr(token_type_embeddings, 'weight'):
+                    token_type_embedding_tensor = token_type_embeddings.weight.data
+                    
+                    # If the token type embeddings has shape (1, ...) then set the shape to
+                    # (2, ...) by randomly initializing the second token type embedding
+                    if token_type_embedding_tensor.shape[0] == 1:
+                        token_type_embeddings.weight.data = torch.cat(
+                            (
+                                token_type_embedding_tensor,
+                                torch.rand_like(token_type_embedding_tensor),
+                            ),
+                            dim=0,
+                        )
+                        token_type_embeddings.num_embeddings = 2
+                        
+                    # Set the model config to use the new type vocab size
+                    model.config.type_vocab_size = 2
+            except AttributeError:
+                # Model doesn't have token type embeddings, which is fine for Gemma3
+                pass
+    
+    return model
+# NEW
+def get_children_of_module(name: str, module: nn.Module) -> nn.Module | dict[str, Any] | None:
+    """Get the children of a module - adapted from EuroEval."""
+    if len(list(module.children())) == 0:
+        if name == "token_type_embeddings":
+            return module
+        else:
+            return None
+    else:
+        submodules = dict()
+        for subname, submodule in module.named_children():
+            children = get_children_of_module(name=subname, module=submodule)
+            if children:
+                submodules[subname] = children
+        return submodules
 
 USE_CUSTOM_TRAINER = True
 
@@ -37,56 +104,76 @@ hf_token = os.getenv("HF_TOKEN")
 hf_token_euroeval = os.getenv("HF_TOKEN_EUROEVAL")
 wandb_api_key = os.getenv("WANDB_API_KEY")
 
-os.environ["WANDB_PROJECT"] = "billm_qa_test"
+os.environ["WANDB_PROJECT"] = "billm_test"
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name_or_path', type=str, required=True,
+parser.add_argument('--model_name_or_path', type=str,
                     help='Specify model_name_or_path to set transformer backbone.')
 parser.add_argument('--dataset_name_or_path', type=str, required=True,
                     help='Specify huggingface dataset name or local file path.')
-parser.add_argument('--epochs', type=int, default=3, help='Specify number of epochs, default 3')
-parser.add_argument('--max_steps', type=int, default=5000, help='Specify max steps, default 5000')
-parser.add_argument('--batch_size', type=int, default=16, help='Specify batch size, default 16')
-parser.add_argument('--learning_rate', type=float, default=3e-5, help='Specify learning rate, default 3e-5')
+parser.add_argument('--epochs', type=int, default=10, help='Specify number of epochs, default 10')
+parser.add_argument('--max_steps', type=int, default=10_000, help='Specify max steps, default 10_000')
+parser.add_argument('--batch_size', type=int, default=128, help='Specify batch size, default 128') # 128 instead of 8
+parser.add_argument('--learning_rate', type=float, default=1e-5, help='Specify learning rate, default 1e-5') # 1e-5 instead of 1e-4
 parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Specify gradient accumulation steps, default 1')
 parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
-parser.add_argument('--max_length', type=int, default=512, help='Specify max length, default 512')
-parser.add_argument('--max_answer_length', type=int, default=30, help='Maximum answer length in tokens, default 30')
+parser.add_argument('--max_length', type=int, default=2048, help='Specify max length, default 2048') # 2048 instead of 512
 parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Specify whether to use PEFT (LoRA), default 1 (enabled)')
-parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16')
+parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16') # 16 instead of 12
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
 parser.add_argument('--push_to_hub', type=int, default=0, choices=[0, 1], help='Specify push_to_hub, default 0')
 parser.add_argument('--hub_model_id', type=str, default=None, help='Hub model ID for pushing')
+# configure device
 parser.add_argument('--gpu_device', type=int, default=None,
                     help='Specify which GPU device to use (0, 1, 2, etc.). If not specified, uses default CUDA device or auto-selects.')
 
 args = parser.parse_args()
 
-# Set CUDA device as early as possible if specified
+# Set CUDA device as early as possible if specified - following multi-choice pattern
 if args.gpu_device is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_device)
     torch.cuda.set_device(0)  # After setting CUDA_VISIBLE_DEVICES, device 0 refers to the selected GPU
 
 print(f'Args: {args}')
 
-class BestMetricsLoggerCallback(TrainerCallback):
+class BestMetricsLoggerCallback(TrainerCallback):    
     def __init__(self):
-        self.best_f1 = 0.0
-        self.best_em = 0.0
-        
-    def on_evaluate(self, args, state, control, logs=None, **kwargs):
-        if logs:
-            current_f1 = logs.get('eval_f1', 0.0)
-            current_em = logs.get('eval_exact_match', 0.0)
-            
-            if current_f1 > self.best_f1:
-                self.best_f1 = current_f1
-                print(f"🏆 New best F1 score: {self.best_f1:.4f}")
-                
-            if current_em > self.best_em:
-                self.best_em = current_em
-                print(f"🏆 New best Exact Match: {self.best_em:.4f}")
+        self.best_metrics = {}
+        self.metric_keywords = [
+            "precision", "recall", "matthews_correlation", "mcc", "accuracy", "loss", "f1", "exact_match"
+        ]
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        for metric, value in metrics.items():
+            # Only track metrics containing specified keywords and are float/int
+            if (
+                isinstance(value, (float, int)) and
+                any(keyword in metric.lower() for keyword in self.metric_keywords)
+            ):
+                # For loss, lower is better; for others, higher is better
+                if "loss" in metric.lower():
+                    is_better = (metric not in self.best_metrics) or (value < self.best_metrics[metric][0])
+                else:
+                    is_better = (metric not in self.best_metrics) or (value > self.best_metrics[metric][0])
+                if is_better:
+                    self.best_metrics[metric] = (value, metrics.copy())
+
+    def on_train_end(self, args, state, control, **kwargs):
+        print("\n========== BEST METRICS SUMMARY ==========")
+        for metric, (best_value, metrics_dict) in self.best_metrics.items():
+            print(f"\nBest {metric}: {best_value:.4f}")
+            print("Related metrics for this run:")
+            for k, v in metrics_dict.items():
+                if (
+                    isinstance(v, (float, int)) and
+                    any(keyword in k.lower() for keyword in self.metric_keywords)
+                ):
+                    print(f"  {k}: {v:.4f}")
+                elif any(keyword in k.lower() for keyword in self.metric_keywords):
+                    print(f"  {k}: {v}")
 
 def get_special_token_metadata(tokenizer: PreTrainedTokenizerBase) -> dict:
     """Extract special token metadata from the tokenizer."""
@@ -171,6 +258,16 @@ def prepare_train_examples(examples, tokenizer):
         # Grab the sequence corresponding to that example (to know what is the context and what is the question).
         sequence_ids = tokenized_examples.sequence_ids(i)
 
+        # Manually ensure that the special tokens are set to None in `sequence_ids` (following EuroEval)
+        for special_token in tokenizer.special_tokens_map.keys():
+            if hasattr(tokenizer, f"{special_token}_id"):
+                special_token_id = getattr(tokenizer, f"{special_token}_id")
+                if special_token_id is not None:
+                    sequence_ids = [
+                        None if token_id == special_token_id else seq_id
+                        for token_id, seq_id in zip(input_ids, sequence_ids)
+                    ]
+
         # One example can give several spans, this is the index of the example containing this span of text.
         sample_index = sample_mapping[i]
         answers = examples["answers"][sample_index]
@@ -201,12 +298,22 @@ def prepare_train_examples(examples, tokenizer):
             else:
                 # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
                 # Note: we could go after the last offset if the answer is the last word (edge case).
-                while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+                while (
+                    token_start_index <= token_end_index
+                    and offsets[token_start_index][0] <= start_char
+                ):
                     token_start_index += 1
-                tokenized_examples["start_positions"].append(token_start_index - 1)
-                while offsets[token_end_index][1] >= end_char:
+                token_start_index -= 1
+                tokenized_examples["start_positions"].append(token_start_index)
+                while (
+                    token_start_index <= token_end_index
+                    and offsets[token_end_index][1] >= end_char
+                ):
                     token_end_index -= 1
-                tokenized_examples["end_positions"].append(token_end_index + 1)
+                token_end_index += 1
+                tokenized_examples["end_positions"].append(token_end_index)
+                # Add assertion to match EuroEval
+                assert token_end_index >= token_start_index
 
     return tokenized_examples
 
@@ -289,8 +396,8 @@ tokenizer = AutoTokenizer.from_pretrained(
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Load metrics
-f1_metric = evaluate.load("squad")
+# Load metrics - using built-in computation instead of evaluate library
+# f1_metric = evaluate.load("squad")  # Not needed - using custom metrics
 
 def compute_f1_em(predictions, references):
     """Compute F1 and EM scores for question answering."""
@@ -338,23 +445,565 @@ def compute_f1_em(predictions, references):
         'exact_match': np.mean(em_scores)
     }
 
+
+
+
+# class QuestionAnsweringTrainer(Trainer):
+#     """Trainer subclass for question answering tasks."""
+
+#     def __init__(
+#         self,
+#         model: "PreTrainedModel | nn.Module",
+#         processing_class: "PreTrainedTokenizerBase",
+#         args: "TrainingArguments",
+#         train_dataset: "Dataset",
+#         eval_dataset: "Dataset",
+#         compute_metrics: "c.Callable[[EvalPrediction], dict[str, float]]",
+#         callbacks: "list[TrainerCallback]",
+#         data_collator: "c.Callable",
+#         **kwargs,
+#     ) -> None:
+#         """Initialise the trainer."""
+#         super().__init__(
+#             model=model,
+#             processing_class=processing_class,
+#             args=args,
+#             train_dataset=train_dataset,
+#             eval_dataset=eval_dataset,
+#             compute_metrics=compute_metrics,
+#             callbacks=callbacks,
+#             data_collator=data_collator,
+#             **kwargs,
+#         )
+
+#         # Get the CLS token id for the tokeniser
+#         if self.tokenizer is not None:
+#             assert isinstance(self.tokenizer, PreTrainedTokenizerBase)
+#             special_token_metadata = get_special_token_metadata(self.tokenizer)
+#             self.cls_token_id = special_token_metadata["cls_token_id"]
+
+#         # Set the label names
+#         self.label_names = ["start_positions", "end_positions"]
+
+#     def evaluate(  # type: ignore[override]
+#         self,
+#         eval_dataset: "Dataset | None" = None,
+#         orig_eval_dataset: "Dataset | None" = None,
+#         ignore_keys: list[str] | None = None,
+#         metric_key_prefix: str = "eval",
+#     ) -> dict[str, float]:
+#         """Evaluate the model on the given dataset.
+
+#         Args:
+#             eval_dataset:
+#                 The dataset to evaluate on. If None, then use the stored evaluation
+#                 dataset.
+#             orig_eval_dataset:
+#                 The original evaluation dataset, before any postprocessing. If None,
+#                 then use the stored original evaluation dataset.
+#             ignore_keys:
+#                 The keys to ignore when computing the metrics.
+#             metric_key_prefix:
+#                 The prefix to use for the metric keys.
+
+#         Returns:
+#             The metrics computed on the evaluation dataset.
+#         """
+#         eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+#         # Temporarily disable metric computation, we will do it in the loop here.
+#         compute_metrics = self.compute_metrics  # type: ignore[has-type]
+#         self.compute_metrics = None
+#         eval_loop = (
+#             self.prediction_loop
+#             if self.args.use_legacy_prediction_loop
+#             else self.evaluation_loop
+#         )
+#         try:
+#             output = eval_loop(
+#                 eval_dataloader,
+#                 description="Evaluation",
+#                 prediction_loss_only=True if compute_metrics is None else None,
+#                 ignore_keys=ignore_keys,
+#                 metric_key_prefix=metric_key_prefix,
+#             )
+#         finally:
+#             self.compute_metrics = compute_metrics
+
+#         predictions = output.predictions
+#         assert isinstance(predictions, tuple)
+
+#         metrics = output.metrics
+#         assert metrics is not None
+
+#         if orig_eval_dataset is not None:
+#             preds_and_labels = postprocess_predictions_and_labels(
+#                 predictions=predictions,  # type: ignore[arg-type]
+#                 dataset=orig_eval_dataset,
+#                 prepared_dataset=eval_dataset,
+#                 cls_token_index=self.cls_token_id,
+#             )
+#             assert self.compute_metrics is not None
+#             new_metrics = self.compute_metrics(preds_and_labels)  # type: ignore[arg-type]
+#             metrics.update(new_metrics)
+
+#             # Prefix all keys with metric_key_prefix + '_'
+#             for key in list(metrics.keys()):
+#                 if not key.startswith(f"{metric_key_prefix}_"):
+#                     metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+#         # Only the main node log the results by default
+#         if self.args.should_log:
+#             self.log(metrics)
+
+#         self.control = self.callback_handler.on_evaluate(
+#             self.args,
+#             self.state,
+#             self.control,  # type: ignore[has-type]
+#             metrics,
+#         )
+#         return metrics
+
+
+
+
 class QuestionAnsweringTrainer(Trainer):
-    """Custom trainer for question answering tasks."""
+    """Custom trainer for question answering tasks with proper post-processing."""
     
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, orig_eval_dataset=None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Store original evaluation dataset for post-processing
+        self._orig_eval_dataset = orig_eval_dataset
         
-    def evaluate(
+        # Set trainer reference in compute_metrics for access to datasets
+        if self.compute_metrics is not None:
+            self.compute_metrics._trainer = self
+        
+                # Get the CLS token id for the tokeniser
+        if self.tokenizer is not None:
+            assert isinstance(self.tokenizer, PreTrainedTokenizerBase)
+            special_token_metadata = get_special_token_metadata(self.tokenizer)
+            self.cls_token_id = special_token_metadata["cls_token_id"]
+
+        print(f"CLS token ID: {self.cls_token_id}")
+
+        cls_token_id = self.tokenizer.cls_token_id if self.tokenizer.cls_token_id is not None else 0
+
+        print(f"CLS token ID 2: {cls_token_id}")
+
+        exit(0)
+    
+
+    def evaluate(  # type: ignore[override]
         self,
-        eval_dataset=None,
-        orig_eval_dataset=None,
-        ignore_keys=None,
-        metric_key_prefix="eval",
-    ):
-        """Override evaluate method to handle QA-specific evaluation."""
-        # Store original dataset for post-processing
-        self._orig_eval_dataset = orig_eval_dataset or eval_dataset
-        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        eval_dataset: "Dataset | None" = None,
+        orig_eval_dataset: "Dataset | None" = None,
+        ignore_keys: list[str] | None = None,
+        metric_key_prefix: str = "eval",
+    ) -> dict[str, float]:
+        """Evaluate the model on the given dataset.
+
+        Args:
+            eval_dataset:
+                The dataset to evaluate on. If None, then use the stored evaluation
+                dataset.
+            orig_eval_dataset:
+                The original evaluation dataset, before any postprocessing. If None,
+                then use the stored original evaluation dataset.
+            ignore_keys:
+                The keys to ignore when computing the metrics.
+            metric_key_prefix:
+                The prefix to use for the metric keys.
+
+        Returns:
+            The metrics computed on the evaluation dataset.
+        """
+        eval_dataset = self.eval_dataset
+        orig_eval_dataset = self._orig_eval_dataset
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        # Temporarily disable metric computation, we will do it in the loop here.
+        compute_metrics = self.compute_metrics  # type: ignore[has-type]
+        self.compute_metrics = None
+        eval_loop = (
+            self.prediction_loop
+            if self.args.use_legacy_prediction_loop
+            else self.evaluation_loop
+        )
+        try:
+            output = eval_loop(
+                eval_dataloader,
+                description="Evaluation",
+                prediction_loss_only=True if compute_metrics is None else None,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+        finally:
+            self.compute_metrics = compute_metrics
+
+        predictions = output.predictions
+        assert isinstance(predictions, tuple)
+
+        metrics = output.metrics
+        assert metrics is not None
+
+        if orig_eval_dataset is not None:
+            preds_and_labels = postprocess_predictions_and_labels(
+                predictions=predictions,  # type: ignore[arg-type]
+                dataset=orig_eval_dataset,
+                prepared_dataset=eval_dataset,
+                cls_token_index=self.cls_token_id,
+            )
+            assert self.compute_metrics is not None
+            new_metrics = self.compute_metrics(preds_and_labels)  # type: ignore[arg-type]
+            metrics.update(new_metrics)
+
+            # Prefix all keys with metric_key_prefix + '_'
+            for key in list(metrics.keys()):
+                if not key.startswith(f"{metric_key_prefix}_"):
+                    metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        # Only the main node log the results by default
+        if self.args.should_log:
+            self.log(metrics)
+
+        self.control = self.callback_handler.on_evaluate(
+            self.args,
+            self.state,
+            self.control,  # type: ignore[has-type]
+            metrics,
+        )
+
+        print("======== Evaluation Results ========")
+        print(metrics)
+        print("====================================")
+
+        exit(0)
+
+        return metrics
+
+    
+    # def evaluate(self, eval_dataset=None, orig_eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+    #     orig_eval_dataset = self._orig_eval_dataset
+    #     eval_dataset = self.eval_dataset
+
+    #     print("======== params in evaluate ========")
+    #     print(eval_dataset)
+    #     print(orig_eval_dataset)
+    #     print(ignore_keys)
+    #     print("===============================")
+
+    #     """Evaluate the model with proper loss computation."""
+    #     # Use the parent class evaluate method to get baseline metrics including loss
+    #     eval_results = super().evaluate(
+    #         eval_dataset=eval_dataset,
+    #         ignore_keys=ignore_keys,
+    #         metric_key_prefix=metric_key_prefix
+    #     )
+
+    #     # Now add our custom QA metrics
+    #     if hasattr(self, '_orig_eval_dataset') and self.compute_metrics is not None:
+    #         eval_examples = orig_eval_dataset if orig_eval_dataset is not None else self._orig_eval_dataset
+            
+    #         if eval_examples is not None:
+    #             # Get predictions from the model
+    #             eval_dataloader = self.get_eval_dataloader(eval_dataset)
+                
+    #             # Temporarily disable metric computation to get raw predictions
+    #             compute_metrics = self.compute_metrics
+    #             self.compute_metrics = None
+                
+    #             try:
+    #                 eval_loop = (
+    #                     self.prediction_loop
+    #                     if self.args.use_legacy_prediction_loop
+    #                     else self.evaluation_loop
+    #                 )
+    #                 output = eval_loop(
+    #                     eval_dataloader,
+    #                     description="Evaluation",
+    #                     prediction_loss_only=False,
+    #                     ignore_keys=ignore_keys,
+    #                     metric_key_prefix=metric_key_prefix,
+    #                 )
+    #             finally:
+    #                 self.compute_metrics = compute_metrics
+                
+    #             # Get QA-specific metrics
+    #             if output.predictions is not None:
+    #                 eval_pred = EvalPrediction(predictions=output.predictions, label_ids=None)
+    #                 qa_metrics = self.compute_metrics(eval_pred)
+                    
+    #                 # Add QA metrics with proper prefix
+    #                 for key, value in qa_metrics.items():
+    #                     prefixed_key = f"{metric_key_prefix}_{key}" if not key.startswith(f"{metric_key_prefix}_") else key
+    #                     eval_results[prefixed_key] = value
+
+    #     # Print detailed results
+    #     print(f"\n=== Question Answering Evaluation Results ({metric_key_prefix}) ===")
+    #     print(f"Evaluation loss: {eval_results.get(f'{metric_key_prefix}_loss', 'N/A')}")
+    #     print(f"QA F1 score: {eval_results.get(f'{metric_key_prefix}_f1', 'N/A')}")
+    #     print(f"QA Exact Match: {eval_results.get(f'{metric_key_prefix}_exact_match', 'N/A')}")
+    #     print("=" * (len(metric_key_prefix) + 50) + "\n")
+
+    #     return eval_results
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """Compute loss for QA model - ensures evaluation loss is available."""
+        # Let the model compute loss naturally first
+        outputs = model(**inputs)
+        
+        # If model already computed loss, use it (this should work for training)
+        if hasattr(outputs, 'loss') and outputs.loss is not None:
+            loss = outputs.loss
+        else:
+            # Only compute manually if model didn't provide loss (evaluation edge case)
+            start_positions = inputs.get("start_positions")
+            end_positions = inputs.get("end_positions")
+            
+            if start_positions is not None and end_positions is not None:
+                start_logits = outputs.start_logits
+                end_logits = outputs.end_logits
+                
+                loss_fct = CrossEntropyLoss(ignore_index=-100)
+                start_loss = loss_fct(start_logits, start_positions)
+                end_loss = loss_fct(end_logits, end_positions)
+                loss = (start_loss + end_loss) / 2
+            else:
+                # No positions provided during evaluation - set loss to 0
+                loss = torch.tensor(0.0, device=outputs.start_logits.device, requires_grad=False)
+        
+        return (loss, outputs) if return_outputs else loss
+
+
+def postprocess_predictions_and_labels(
+    predictions: tuple[np.ndarray, ...],
+    dataset: "Dataset",
+    prepared_dataset: "Dataset",
+    cls_token_index: int,
+) -> tuple[list[dict], list[dict]]:
+    """Postprocess the predictions and labels, to allow easier metric computation.
+
+    Args:
+        predictions:
+            A tuple whose first two elements are (start_logits, end_logits).
+        dataset:
+            The dataset containing the examples.
+        prepared_dataset:
+            The dataset containing the prepared examples.
+        cls_token_index:
+            The index of the CLS token.
+
+    Returns:
+        The postprocessed predictions and labels.
+    """
+    if len(predictions) < 2:
+        raise ValueError("`predictions` should be a tuple with at least two elements.")
+
+    all_start_logits, all_end_logits = predictions[:2]
+
+    # Build a map from an example to its corresponding features, being the blocks of
+    # text from the context that we're feeding into the model. An example can have
+    # multiple features/blocks if it has a long context.
+    id_to_index = {k: i for i, k in enumerate(dataset["id"])}
+    features_per_example = defaultdict(list)
+    for i, feature in enumerate(prepared_dataset):
+        id = feature["id"]
+        example_index = id_to_index[id]
+        features_per_example[example_index].append(i)
+
+    # Loop over all the examples
+    prediction_list: list[dict[str, t.Any]] = list()
+    labels = list()
+    for example_index, example in enumerate(dataset):
+        # Extract the best valid answer associated with the current example
+        best_answer = find_best_answer(
+            all_start_logits=all_start_logits,
+            all_end_logits=all_end_logits,
+            prepared_dataset=prepared_dataset,
+            feature_indices=features_per_example[example_index],
+            context=example["context"],
+            max_answer_length=30,
+            num_best_logits=20,
+            min_null_score=0.0,
+            cls_token_index=cls_token_index,
+        )
+
+        # Create the final prediction dictionary, to be added to the list of
+        # predictions
+        prediction = dict(
+            id=example["id"], prediction_text=best_answer, no_answer_probability=0.0
+        )
+
+        # Add the answer to the list of predictions
+        prediction_list.append(prediction)
+
+        # Create the associated reference dictionary, to be added to the list of
+        # references
+        label = dict(
+            id=example["id"],
+            answers=dict(
+                text=example["answers"]["text"],
+                answer_start=example["answers"]["answer_start"],
+            ),
+        )
+
+        # Add the answer and label to the list of predictions and labels, respectively
+        labels.append(label)
+
+    return prediction_list, labels
+
+def find_best_answer(
+    all_start_logits: np.ndarray,
+    all_end_logits: np.ndarray,
+    prepared_dataset: "Dataset",
+    feature_indices: list[int],
+    context: str,
+    max_answer_length: int,
+    num_best_logits: int,
+    min_null_score: float,
+    cls_token_index: int,
+) -> str:
+    """Find the best answer for a given example.
+
+    Args:
+        all_start_logits:
+            The start logits for all the features.
+        all_end_logits:
+            The end logits for all the features.
+        prepared_dataset:
+            The dataset containing the prepared examples.
+        feature_indices:
+            The indices of the features associated with the current example.
+        context:
+            The context of the example.
+        max_answer_length:
+            The maximum length of the answer.
+        num_best_logits:
+            The number of best logits to consider.
+        min_null_score:
+            The minimum score an answer can have.
+        cls_token_index:
+            The index of the CLS token.
+
+    Returns:
+        The best answer for the example.
+    """
+    # Loop through all the features associated to the current example
+    valid_answers = list()
+    for feature_index in feature_indices:
+        # Get the features associated with the current example
+        features = prepared_dataset[feature_index]
+
+        # Get the predictions of the model for this feature
+        start_logits = all_start_logits[feature_index]
+        end_logits = all_end_logits[feature_index]
+
+        # Update minimum null prediction
+        cls_index = features["input_ids"].index(cls_token_index)
+        feature_null_score = (start_logits[cls_index] + end_logits[cls_index]).item()
+        if min_null_score < feature_null_score:
+            min_null_score = feature_null_score
+
+        # Find the valid answers for the feature
+        valid_answers_for_feature = find_valid_answers(
+            start_logits=start_logits,
+            end_logits=end_logits,
+            offset_mapping=features["offset_mapping"],
+            context=context,
+            max_answer_length=max_answer_length,
+            num_best_logits=num_best_logits,
+            min_null_score=min_null_score,
+        )
+        valid_answers.extend(valid_answers_for_feature)
+
+    # In the very rare edge case we have not a single non-null prediction, we create a
+    # fake prediction to avoid failure
+    if not valid_answers:
+        return ""
+
+    # Otherwise, we select the answer with the largest score as the best answer, and
+    # return it
+    best_answer_dict = sorted(valid_answers, key=lambda x: x["score"], reverse=True)[0]
+    return best_answer_dict["text"]
+
+def find_valid_answers(
+    start_logits: np.ndarray,
+    end_logits: np.ndarray,
+    offset_mapping: list[tuple[int, int]],
+    context: str,
+    max_answer_length: int,
+    num_best_logits: int,
+    min_null_score: float,
+) -> list[dict]:
+    """Find the valid answers from the start and end indexes.
+
+    Args:
+        start_logits:
+            The logits for the start of the answer.
+        end_logits:
+            The logits for the end of the answer.
+        offset_mapping:
+            The offset mapping, being a list of pairs of integers for each token index,
+            containing the start and end character index in the original context.
+        context:
+            The context of the example.
+        max_answer_length:
+            The maximum length of the answer.
+        num_best_logits:
+            The number of best logits to consider. Note that this function will run in
+            O(`num_best_logits` ^ 2) time.
+        min_null_score:
+            The minimum score an answer can have.
+
+    Returns:
+        A list of the valid answers, each being a dictionary with keys "text" and
+        "score", the score being the sum of the start and end logits.
+    """
+    # Fetch the top-k predictions for the start- and end token indices
+    start_indexes = np.argsort(start_logits)[-1 : -num_best_logits - 1 : -1].tolist()
+    end_indexes = np.argsort(end_logits)[-1 : -num_best_logits - 1 : -1].tolist()
+
+    # We loop over all combinations of starting and ending indexes for valid answers
+    valid_answers = list()
+    for start_index in start_indexes:
+        for end_index in end_indexes:
+            # If the starting or ending index is out-of-scope, meaning that they are
+            # either out of bounds or correspond to part of the input_ids that are not
+            # in the context, then we skip this index
+            if (
+                start_index >= len(offset_mapping)
+                or end_index >= len(offset_mapping)
+                or tuple(offset_mapping[start_index]) == (-1, -1)
+                or tuple(offset_mapping[end_index]) == (-1, -1)
+            ):
+                continue
+
+            # Do not consider answers with a length that is either negative or greater
+            # than the context length
+            max_val = max_answer_length + start_index - 1
+            if end_index < start_index or end_index > max_val:
+                continue
+
+            # If we got to this point then the answer is valid, so we store the
+            # corresponding start- and end character indices in the original context,
+            # and from these extract the answer
+            start_char = offset_mapping[start_index][0]
+            end_char = offset_mapping[end_index][1]
+            text = context[start_char:end_char]
+
+            # Compute the score of the answer, being the sum of the start and end
+            # logits. Intuitively, this indicates how likely the answer is to be
+            # correct, and allows us to pick the best valid answer.
+            score = start_logits[start_index] + end_logits[end_index]
+
+            # Add the answer to the list of valid answers, if the score is greater
+            # than the minimum null score
+            if score > min_null_score:
+                valid_answers.append(dict(score=score, text=text))
+
+    return valid_answers
 
 def postprocess_qa_predictions(
     predictions: Tuple[np.ndarray, np.ndarray],
@@ -499,42 +1148,166 @@ def postprocess_qa_predictions(
     return predictions
 
 def compute_metrics(eval_pred: EvalPrediction):
-    """Compute QA metrics."""
+    """Compute QA metrics with proper post-processing - matches EuroEval pattern."""
     predictions, labels = eval_pred
     
-    # Get the trainer instance to access datasets
+    # Get the trainer and datasets from the global reference
+    if not hasattr(compute_metrics, '_trainer') or compute_metrics._trainer is None:
+        # If trainer not available, return dummy metrics
+        return {"f1": 0.0, "exact_match": 0.0}
+    
     trainer = compute_metrics._trainer
     
-    if hasattr(trainer, '_orig_eval_dataset') and trainer._orig_eval_dataset is not None:
-        examples = trainer._orig_eval_dataset
-        features = trainer.eval_dataset
+    # Use the evaluation dataset and original examples
+    if hasattr(trainer, '_orig_eval_dataset') and hasattr(trainer, 'eval_dataset'):
+        eval_examples = trainer._orig_eval_dataset
+        eval_features = trainer.eval_dataset
         
-        # Post-process predictions
-        processed_predictions = postprocess_qa_predictions(
-            predictions=predictions,
-            features=features,
-            examples=examples,
-            tokenizer=tokenizer,
-            max_answer_length=args.max_answer_length,
-        )
+        # Get CLS token index for postprocessing (following EuroEval pattern)
+        cls_token_id = trainer.tokenizer.cls_token_id if trainer.tokenizer.cls_token_id is not None else 0
         
-        # Format predictions and references for evaluation
+        # Use EuroEval-style postprocessing
+        from collections import defaultdict
+        
+        # Build a map from an example to its corresponding features
+        id_to_index = {k: i for i, k in enumerate(eval_examples["id"])}
+        features_per_example = defaultdict(list)
+        for i, feature in enumerate(eval_features):
+            feature_id = feature["id"]
+            example_index = id_to_index[feature_id]
+            features_per_example[example_index].append(i)
+        
+        # Extract predictions for each example
         formatted_predictions = []
         formatted_references = []
         
-        for example in examples:
-            example_id = example["id"]
-            pred_text = processed_predictions.get(example_id, "")
-            ref_texts = example["answers"]["text"]
-            
-            formatted_predictions.append(pred_text)
-            formatted_references.append(ref_texts)
+        all_start_logits, all_end_logits = predictions
         
-        # Compute metrics
-        return compute_f1_em(formatted_predictions, formatted_references)
+        for example_index, example in enumerate(eval_examples):
+            # Find best answer using EuroEval-style logic
+            feature_indices = features_per_example[example_index]
+            
+            # Get the best answer for this example
+            best_answer = find_best_answer_euroeval_style(
+                all_start_logits=all_start_logits,
+                all_end_logits=all_end_logits,
+                eval_features=eval_features,
+                feature_indices=feature_indices,
+                context=example["context"],
+                cls_token_id=cls_token_id,
+            )
+            
+            formatted_predictions.append(best_answer)
+            formatted_references.append(example["answers"]["text"])
+        
+        # Compute F1 and EM scores
+        metrics = compute_f1_em(formatted_predictions, formatted_references)
+        return metrics
+    else:
+        # Fallback to dummy metrics if datasets not properly stored
+        return {"f1": 0.0, "exact_match": 0.0}
+
+def find_best_answer_euroeval_style(
+    all_start_logits: np.ndarray,
+    all_end_logits: np.ndarray,
+    eval_features,
+    feature_indices: List[int],
+    context: str,
+    cls_token_id: int,
+    max_answer_length: int = 30,
+    num_best_logits: int = 20,
+) -> str:
+    """Find the best answer following EuroEval's exact logic."""
+    valid_answers = []
+    min_null_score = -1000000.0  # Very low initial score
     
-    # Fallback if we can't access the original dataset
-    return {"f1": 0.0, "exact_match": 0.0}
+    # Loop through all features for this example
+    for feature_index in feature_indices:
+        # Get the predictions for this feature
+        start_logits = all_start_logits[feature_index]
+        end_logits = all_end_logits[feature_index]
+        
+        # Get feature data
+        feature = eval_features[feature_index]
+        input_ids = feature["input_ids"]
+        
+        # Find CLS token index
+        try:
+            cls_index = input_ids.index(cls_token_id)
+        except ValueError:
+            cls_index = 0
+        
+        # Update minimum null score
+        feature_null_score = (start_logits[cls_index] + end_logits[cls_index]).item()
+        if min_null_score < feature_null_score:
+            min_null_score = feature_null_score
+        
+        # Get offset mapping
+        offset_mapping = feature["offset_mapping"]
+        
+        # Find valid answers for this feature
+        valid_answers_for_feature = find_valid_answers_euroeval_style(
+            start_logits=start_logits,
+            end_logits=end_logits,
+            offset_mapping=offset_mapping,
+            context=context,
+            max_answer_length=max_answer_length,
+            num_best_logits=num_best_logits,
+            min_null_score=min_null_score,
+        )
+        valid_answers.extend(valid_answers_for_feature)
+    
+    # Return best answer or empty string
+    if not valid_answers:
+        return ""
+    
+    best_answer_dict = sorted(valid_answers, key=lambda x: x["score"], reverse=True)[0]
+    return best_answer_dict["text"]
+
+def find_valid_answers_euroeval_style(
+    start_logits: np.ndarray,
+    end_logits: np.ndarray,
+    offset_mapping: list,
+    context: str,
+    max_answer_length: int,
+    num_best_logits: int,
+    min_null_score: float,
+) -> List[dict]:
+    """Find valid answers following EuroEval's exact logic."""
+    # Get top-k predictions for start and end
+    start_indexes = np.argsort(start_logits)[-1 : -num_best_logits - 1 : -1].tolist()
+    end_indexes = np.argsort(end_logits)[-1 : -num_best_logits - 1 : -1].tolist()
+    
+    valid_answers = []
+    for start_index in start_indexes:
+        for end_index in end_indexes:
+            # Check if indices are valid
+            if (
+                start_index >= len(offset_mapping)
+                or end_index >= len(offset_mapping)
+                or offset_mapping[start_index] is None
+                or offset_mapping[end_index] is None
+            ):
+                continue
+            
+            # Check answer length constraints
+            max_val = max_answer_length + start_index - 1
+            if end_index < start_index or end_index > max_val:
+                continue
+            
+            # Extract answer text
+            start_char = offset_mapping[start_index][0]
+            end_char = offset_mapping[end_index][1]
+            text = context[start_char:end_char]
+            
+            # Calculate score
+            score = start_logits[start_index] + end_logits[end_index]
+            
+            # Add if score is good enough
+            if score > min_null_score:
+                valid_answers.append({"score": score, "text": text})
+    
+    return valid_answers
 
 # Load and prepare dataset
 print(f"Loading dataset: {args.dataset_name_or_path}")
@@ -554,7 +1327,7 @@ if "val" not in dataset and "test" not in dataset:
     dataset = dataset["train"].train_test_split(test_size=0.1)
     dataset = DatasetDict({
         "train": dataset["train"],
-        "validation": dataset["test"]
+        "val": dataset["test"]
     })
 
 # Process training data
@@ -578,44 +1351,55 @@ eval_dataset = dataset[eval_split].map(
 
 # Initialize model - focusing only on Gemma3 as requested
 if any(x in args.model_name_or_path.lower() for x in ['gemma3', 'gemma-3', 'gemma_3']):
-    MODEL = Gemma3ForTokenClassification
+    MODEL = Gemma3ForQuestionAnswering
     lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 else:
     raise ValueError("This script only supports Gemma3 models. Please use a Gemma3 model.")
 
-# For QA, we need 2 labels: start_position and end_position
-num_labels = 2
-id2label = {0: "start_position", 1: "end_position"}
-label2id = {v: k for k, v in id2label.items()}
-
 model = MODEL.from_pretrained(
     args.model_name_or_path,
-    num_labels=num_labels,
-    id2label=id2label,
-    label2id=label2id,
     token=hf_token,
 )
 
-# Device and dtype handling
+# Setup model for QA following EuroEval pattern
+model = setup_model_for_question_answering(model)
+
+# Device and dtype handling - following multi-choice pattern
+# Clear CUDA cache to avoid memory issues from previous runs
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 if torch.backends.mps.is_available() and args.gpu_device is None:
     device = torch.device("mps")
-    print(f"Using MPS device: {device}")
+    model = model.to(device)
+    print("Using MPS device. bfloat16 is not supported, using default dtype.")
 elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"Using CUDA device: {device}")
+    if args.gpu_device is not None:
+        # When CUDA_VISIBLE_DEVICES is set, PyTorch sees only the specified GPU as device 0
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            raise ValueError(f"GPU device {args.gpu_device} not available or CUDA not accessible")
+        device = torch.device("cuda:0")  # Always use device 0 since CUDA_VISIBLE_DEVICES isolates the GPU
+        # Ensure we're using the correct device
+        with torch.cuda.device(0):
+            model = model.to(device).bfloat16()
+        print(f"Using CUDA device {args.gpu_device} (mapped to cuda:0): {torch.cuda.get_device_name(0)} with bfloat16.")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+    else:
+        device = torch.device("cuda")
+        model = model.to(device).bfloat16()
+        print(f"Using default CUDA device: {torch.cuda.get_device_name()} with bfloat16.")
 else:
+    if args.gpu_device is not None:
+        print(f"Warning: GPU device {args.gpu_device} specified but CUDA not available. Using CPU.")
     device = torch.device("cpu")
-    print(f"Using CPU device: {device}")
-
-model.to(device)
+    model = model.to(device)
+    print("Using CPU device. bfloat16 is not used.")
 
 # Configure LoRA/PEFT if enabled
 if args.use_peft:
+    print("Applying PEFT (LoRA) configuration...")
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS,
+        task_type=TaskType.QUESTION_ANS,
         inference_mode=False,
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -625,7 +1409,11 @@ if args.use_peft:
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 else:
-    print("Using full fine-tuning (no LoRA)")
+    print("Using full fine-tuning (no PEFT)...")
+    # For full fine-tuning, all parameters are trainable
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params:,} || All params: {total_params:,} || Trainable%: {100 * trainable_params / total_params:.2f}")
 
 # Data collator for token classification
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
@@ -657,9 +1445,6 @@ class QuestionAnsweringDataCollator:
         return batch
 
 qa_data_collator = QuestionAnsweringDataCollator(tokenizer=tokenizer)
-
-# Store trainer reference in compute_metrics for access to datasets
-compute_metrics._trainer = None
 
 model_name = args.model_name_or_path.split("/")[-1]
 actual_batch_size = args.batch_size * args.gradient_accumulation_steps
@@ -698,6 +1483,8 @@ training_args = TrainingArguments(
     # weight_decay=args.weight_decay,
     gradient_accumulation_steps=args.gradient_accumulation_steps,
     load_best_model_at_end=True,
+    # metric_for_best_model="eval_loss",  # Use eval_loss for model selection
+    # greater_is_better=False,  # Lower loss is better
     push_to_hub=bool(args.push_to_hub),
     hub_model_id=args.hub_model_id,
     report_to="wandb",
@@ -712,34 +1499,43 @@ else:
     TRAINER = Trainer
 
 # Initialize trainer
-trainer = TRAINER(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    tokenizer=tokenizer,
-    data_collator=qa_data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()],
-)
-
-# Store trainer reference for compute_metrics
-compute_metrics._trainer = trainer
+if USE_CUSTOM_TRAINER:
+    # Pass original evaluation dataset for post-processing
+    trainer = TRAINER(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        data_collator=qa_data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()],
+        orig_eval_dataset=dataset[eval_split],  # Pass original dataset for post-processing
+    )
+else:
+    trainer = TRAINER(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        data_collator=qa_data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()],
+    )
 
 # Clear cache before training
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
+    print(f"GPU memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
 print("Starting training...")
+
 trainer.train()
 
 # Evaluate the model
 print("Evaluating model...")
-eval_results = trainer.evaluate(
-    eval_dataset=eval_dataset, 
-    orig_eval_dataset=dataset[eval_split],
-    metric_key_prefix="test"
-)
+eval_results = trainer.evaluate(eval_dataset=eval_dataset, metric_key_prefix="test")
 
 # Print results
 print(f"Training arguments: {training_args}")
@@ -752,3 +1548,14 @@ if args.push_to_hub:
     trainer.push_to_hub()
 
 print("Training completed!")
+
+"""
+
+
+
+
+to run:
+
+python src/finetune_question_answering.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path scandiqa_da --use_peft 0 --batch_size 8 --gradient_accumulation_steps 16 --gpu_device 1
+
+"""
