@@ -560,7 +560,7 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
             **kwargs,
         )
         hidden_states = transformer_outputs.last_hidden_state
-        logits = self.score(hidden_states)
+        
 
         if input_ids is not None:
             batch_size = input_ids.shape[0]
@@ -583,41 +583,43 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
             )
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+        pooled_hidden_states = hidden_states[torch.arange(batch_size, device=logits.device), last_non_pad_token]
+
+        pooled_logits = self.score(pooled_hidden_states)
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
+            # loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
 
-            # if self.config.problem_type is None:
-            #     if self.num_labels == 1:
-            #         self.config.problem_type = "regression"
-            #     elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-            #         self.config.problem_type = "single_label_classification"
-            #     else:
-            #         self.config.problem_type = "multi_label_classification"
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    self.config.problem_type = "regression"
+                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                    self.config.problem_type = "single_label_classification"
+                else:
+                    self.config.problem_type = "multi_label_classification"
 
-            # if self.config.problem_type == "regression":
-            #     if self._PRINT_LOSS_TYPE:
-            #         print("Using MSELoss for regression")
-            #         self._PRINT_LOSS_TYPE = False
-            #     loss_fct = MSELoss()
-            #     if self.num_labels == 1:
-            #         loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-            #     else:
-            #         loss = loss_fct(pooled_logits, labels)
-            # elif self.config.problem_type == "single_label_classification":
-            #     if self._PRINT_LOSS_TYPE:
-            #         print("Using CrossEntropyLoss for single_label_classification")
-            #         self._PRINT_LOSS_TYPE = False
-            #     loss_fct = CrossEntropyLoss()
-            #     loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            # elif self.config.problem_type == "multi_label_classification":
-            #     if self._PRINT_LOSS_TYPE:
-            #         print("Using BCEWithLogitsLoss for multi_label_classification")
-            #         self._PRINT_LOSS_TYPE = False
-            #     loss_fct = BCEWithLogitsLoss()
-            #     loss = loss_fct(pooled_logits, labels)
+            if self.config.problem_type == "regression":
+                if self._PRINT_LOSS_TYPE:
+                    print("Using MSELoss for regression")
+                    self._PRINT_LOSS_TYPE = False
+                loss_fct = MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(pooled_logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                if self._PRINT_LOSS_TYPE:
+                    print("Using CrossEntropyLoss for single_label_classification")
+                    self._PRINT_LOSS_TYPE = False
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                if self._PRINT_LOSS_TYPE:
+                    print("Using BCEWithLogitsLoss for multi_label_classification")
+                    self._PRINT_LOSS_TYPE = False
+                loss_fct = BCEWithLogitsLoss()
+                loss = loss_fct(pooled_logits, labels)
 
         return SequenceClassifierOutputWithPast(
             loss=loss,
@@ -761,7 +763,7 @@ class Gemma3ForTokenClassification(Gemma3PreTrainedModel):
         )
 
 class Gemma3ForQuestionAnswering(Gemma3PreTrainedModel):
-    """Gemma3 model for Question Answering - adapted from EuroEval's approach."""
+    """Gemma3 model for Question Answering"""
     
     def __init__(self, config):
         super().__init__(config)
