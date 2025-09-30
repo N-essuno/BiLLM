@@ -74,7 +74,8 @@ def setup_model_for_question_answering(model: Gemma3ForQuestionAnswering) -> Gem
                     # Set the model config to use the new type vocab size
                     model.config.type_vocab_size = 2
             except AttributeError:
-                # Model doesn't have token type embeddings, which is fine for Gemma3
+                # Model doesn't have token type embeddings
+                print("Model doesn't have token type embeddings.")
                 pass
     
     return model
