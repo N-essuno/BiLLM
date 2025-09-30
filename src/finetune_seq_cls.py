@@ -15,7 +15,7 @@ parser.add_argument('--epochs', type=int, default=10, help='Specify number of ep
 parser.add_argument('--batch_size', type=int, default=128, help='Specify number of batch size, default 128') # 128 instead of 8
 parser.add_argument('--learning_rate', type=float, default=1e-5, help='Specify learning rate, default 1e-5') # 1e-5 instead of 1e-4
 parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Specify gradient accumulation steps, default 1')
-parser.add_argument('--weight_decay', type=float, default=0.01, help='Specify weight decay, default 0.01')
+parser.add_argument('--weight_decay', type=float, default=0.0, help='Specify weight decay, default 0.0')
 parser.add_argument('--max_length', type=int, default=2048, help='Specify max length, default 2048') # 2048 instead of 64
 parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Specify whether to use PEFT (LoRA), default 1 (enabled)')
 parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16') # 16 instead of 12
@@ -28,6 +28,7 @@ parser.add_argument('--hub_model_id', type=str, default=None,
 # configure device
 parser.add_argument('--gpu_device', type=int, default=None,
                     help='Specify which GPU device to use (0, 1, 2, etc.). If not specified, uses default CUDA device or auto-selects.')
+parser.add_argument('--run_name_suffix', type=str, default='', help='Specify run name suffix, default empty string')
 args = parser.parse_args()
 
 # Set CUDA device as early as possible if specified
@@ -350,12 +351,13 @@ actual_batch_size = args.batch_size * args.gradient_accumulation_steps
 i = 1
 # Include PEFT in output directory name
 peft_suffix = "lora" if args.use_peft else "full"
-output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+run_name_suffix = args.run_name_suffix
+output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Check if output_dir exists, if so, increment i
 while os.path.exists(output_dir):
     i += 1
-    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}".replace('.', '').replace('_-', '_').replace('-_', '_')
+    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 print(f"Output directory: {output_dir}")
 
@@ -382,9 +384,10 @@ training_args = TrainingArguments(
     push_to_hub=args.push_to_hub,
     hub_model_id=args.hub_model_id,
     report_to="wandb",
+    max_grad_norm=1.0,
 )
 
-patience = 20
+patience = 100
 # Initialize trainer
 trainer = Trainer(
     model=model,
@@ -469,6 +472,9 @@ python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step15
 tests
 
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 0
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --run_name_suffix lukas
+
 
 
 """
