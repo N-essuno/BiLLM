@@ -583,6 +583,7 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
                 "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
             )
 
+        # select the hidden state of the last non-padding token for each sequence in the batch
         pooled_hidden_states = hidden_states[torch.arange(batch_size, device=hidden_states.device), last_non_pad_token]
 
         pooled_logits = self.score(pooled_hidden_states)
@@ -601,7 +602,7 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
 
             if self.config.problem_type == "regression":
                 if self._PRINT_LOSS_TYPE:
-                    print("Using MSELoss for regression")
+                    # print("Using MSELoss for regression")
                     self._PRINT_LOSS_TYPE = False
                 loss_fct = MSELoss()
                 if self.num_labels == 1:
@@ -610,13 +611,13 @@ class Gemma3ForSequenceClassification(Gemma3PreTrainedModel):
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 if self._PRINT_LOSS_TYPE:
-                    print("Using CrossEntropyLoss for single_label_classification")
+                    # print("Using CrossEntropyLoss for single_label_classification")
                     self._PRINT_LOSS_TYPE = False
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
                 if self._PRINT_LOSS_TYPE:
-                    print("Using BCEWithLogitsLoss for multi_label_classification")
+                    # print("Using BCEWithLogitsLoss for multi_label_classification")
                     self._PRINT_LOSS_TYPE = False
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)

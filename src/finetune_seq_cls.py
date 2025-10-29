@@ -21,20 +21,29 @@ parser.add_argument('--use_peft', type=int, default=1, choices=[0, 1], help='Spe
 parser.add_argument('--lora_r', type=int, default=16, help='Specify lora r, default 16') # 16 instead of 12
 parser.add_argument('--lora_alpha', type=int, default=32, help='Specify lora alpha, default 32')
 parser.add_argument('--lora_dropout', type=float, default=0.1, help='Specify lora dropout, default 0.1')
+parser.add_argument('--freeze_base_model', type=int, default=0, choices=[0, 1], help='Specify whether to freeze base model and train only classification head, default 0 (disabled)')
 # configure hub
 parser.add_argument('--push_to_hub', type=int, default=0, choices=[0, 1], help='Specify push_to_hub, default 0')
 parser.add_argument('--hub_model_id', type=str, default=None,
                     help='Specify push_to_hub_model_id, default None, format like organization/model_id')
 # configure device
-parser.add_argument('--gpu_device', type=int, default=None,
-                    help='Specify which GPU device to use (0, 1, 2, etc.). If not specified, uses default CUDA device or auto-selects.')
+parser.add_argument('--gpu_device', type=str, default=None,
+                    help='Specify which GPU device to use (0, 1, 2, etc.) or "all" to use all available GPUs. If not specified, uses default CUDA device or auto-selects.')
 parser.add_argument('--run_name_suffix', type=str, default='', help='Specify run name suffix, default empty string')
 args = parser.parse_args()
 
 # Set CUDA device as early as possible if specified
-if args.gpu_device is not None:
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_device)
-    print(f"Set CUDA_VISIBLE_DEVICES to: {args.gpu_device}")
+if args.gpu_device is not None and args.gpu_device != "all":
+    # Convert to int if it's a numeric string
+    try:
+        gpu_id = int(args.gpu_device)
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        print(f"Set CUDA_VISIBLE_DEVICES to: {gpu_id}")
+    except ValueError:
+        raise ValueError(f"Invalid gpu_device value: {args.gpu_device}. Must be an integer or 'all'.")
+elif args.gpu_device == "all":
+    print("Using all available GPUs for training")
+    # Don't set CUDA_VISIBLE_DEVICES when using all GPUs
 
 import numpy as np
 import evaluate
@@ -99,7 +108,6 @@ class BestMetricsLoggerCallback(TrainerCallback):
                 elif any(keyword in k.lower() for keyword in self.metric_keywords):
                     print(f"  {k}: {v}")
 
-
 # Load dataset and inspect structure
 if args.dataset_name_or_path == 'dala':
     ds = load_dataset("giannor/dala", token=hf_token)
@@ -140,7 +148,7 @@ elif tokenizer.pad_token is None:
 lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 if 'mistral' in args.model_name_or_path.lower():
     MODEL = MistralForSequenceClassification
-elif 'llama' in args.model_name_or_path.lower():
+elif any(x in args.model_name_or_path.lower() for x in ['llama', 'munin']):
     MODEL = LlamaForSequenceClassification
 elif 'qwen2' in args.model_name_or_path.lower():
     MODEL = Qwen2ForSequenceClassification
@@ -172,16 +180,35 @@ if torch.backends.mps.is_available() and args.gpu_device is None:
     model = model.to(device)
     print("Using MPS device. bfloat16 is not supported, using default dtype.")
 elif torch.cuda.is_available():
-    if args.gpu_device is not None:
-        # When CUDA_VISIBLE_DEVICES is set, PyTorch sees only the specified GPU as device 0
-        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
-            raise ValueError(f"GPU device {args.gpu_device} not available or CUDA not accessible")
-        device = torch.device("cuda:0")  # Always use device 0 since CUDA_VISIBLE_DEVICES isolates the GPU
-        # Ensure we're using the correct device
-        with torch.cuda.device(0):
+    if args.gpu_device == "all":
+        # Use all available GPUs
+        if torch.cuda.device_count() > 1:
+            print(f"Using all {torch.cuda.device_count()} available GPUs with DataParallel")
+            device = torch.device("cuda")
             model = model.to(device).bfloat16()
-        print(f"Using CUDA device {args.gpu_device} (mapped to cuda:0): {torch.cuda.get_device_name(0)} with bfloat16.")
-        print(f"Current CUDA device: {torch.cuda.current_device()}")
+            # DataParallel will be applied by the Trainer automatically when multiple GPUs are detected
+            for i in range(torch.cuda.device_count()):
+                print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        else:
+            print("Only 1 GPU available, using single GPU mode")
+            device = torch.device("cuda:0")
+            model = model.to(device).bfloat16()
+            print(f"Using CUDA device 0: {torch.cuda.get_device_name(0)} with bfloat16.")
+    elif args.gpu_device is not None:
+        # Use specific GPU device
+        try:
+            gpu_id = int(args.gpu_device)
+            # When CUDA_VISIBLE_DEVICES is set, PyTorch sees only the specified GPU as device 0
+            if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+                raise ValueError(f"GPU device {gpu_id} not available or CUDA not accessible")
+            device = torch.device("cuda:0")  # Always use device 0 since CUDA_VISIBLE_DEVICES isolates the GPU
+            # Ensure we're using the correct device
+            with torch.cuda.device(0):
+                model = model.to(device).bfloat16()
+            print(f"Using CUDA device {gpu_id} (mapped to cuda:0): {torch.cuda.get_device_name(0)} with bfloat16.")
+            print(f"Current CUDA device: {torch.cuda.current_device()}")
+        except ValueError:
+            raise ValueError(f"Invalid gpu_device value: {args.gpu_device}. Must be an integer or 'all'.")
     else:
         device = torch.device("cuda")
         model = model.to(device).bfloat16()
@@ -193,7 +220,7 @@ else:
     model = model.to(device)
     print("Using CPU device. bfloat16 is not used.")
 
-# Configure LoRA/PEFT if enabled
+# Configure training mode
 if args.use_peft:
     print("Applying PEFT (LoRA) configuration...")
     peft_config = LoraConfig(
@@ -206,6 +233,20 @@ if args.use_peft:
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
+elif args.freeze_base_model:
+    print("Freezing base model, training only classification head...")
+    # Freeze all parameters in the base model
+    for param in model.model.parameters():
+        param.requires_grad = False
+    
+    # Keep classification head trainable
+    for param in model.score.parameters():
+        param.requires_grad = True
+    
+    # Print trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params:,} || All params: {total_params:,} || Trainable%: {100 * trainable_params / total_params:.2f}")
 else:
     print("Using full fine-tuning (no PEFT)...")
     # For full fine-tuning, all parameters are trainable
@@ -349,15 +390,21 @@ model_name = args.model_name_or_path.split("/")[-1]
 actual_batch_size = args.batch_size * args.gradient_accumulation_steps
 
 i = 1
-# Include PEFT in output directory name
-peft_suffix = "lora" if args.use_peft else "full"
+# Include training type in output directory name
+if args.use_peft:
+    training_suffix = "lora"
+elif args.freeze_base_model:
+    training_suffix = "head_only"
+else:
+    training_suffix = "full"
+
 run_name_suffix = args.run_name_suffix
-output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
+output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{training_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 # Check if output_dir exists, if so, increment i
 while os.path.exists(output_dir):
     i += 1
-    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{peft_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
+    output_dir = f"{args.dataset_name_or_path.replace('/', '-')}_{model_name}_{training_suffix}_{actual_batch_size}_{i}_{run_name_suffix}".replace('.', '').replace('_-', '_').replace('-_', '_')
 
 print(f"Output directory: {output_dir}")
 
@@ -366,12 +413,10 @@ wandb.init(name=output_dir)
 # EuroStyle - Adapted from src/euroeval/finetuning.py
 training_args = TrainingArguments(
     output_dir=output_dir,
-    eval_strategy=IntervalStrategy.STEPS,
-    save_strategy=IntervalStrategy.STEPS,
-    eval_steps=30,
+    eval_strategy=IntervalStrategy.EPOCH,
+    save_strategy=IntervalStrategy.EPOCH,
     logging_steps=30,
-    save_steps=30,
-    max_steps=10_000,  # (1 if testing)
+    num_train_epochs=args.epochs,
     save_total_limit=1,
     per_device_train_batch_size=args.batch_size,  # Default varies
     per_device_eval_batch_size=args.batch_size,
@@ -385,9 +430,9 @@ training_args = TrainingArguments(
     hub_model_id=args.hub_model_id,
     report_to="wandb",
     max_grad_norm=1.0,
+    weight_decay=args.weight_decay,
 )
 
-patience = 100
 # Initialize trainer
 trainer = Trainer(
     model=model,
@@ -397,7 +442,7 @@ trainer = Trainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=patience), BestMetricsLoggerCallback()],
+    callbacks=[BestMetricsLoggerCallback()],
 )
 
 # Train the model
@@ -408,7 +453,7 @@ if args.push_to_hub:
     trainer.push_to_hub()
 
 # Evaluate the model
-eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"])
+eval_results = trainer.evaluate(eval_dataset=tokenized_ds["test"], metric_key_prefix="test")
 
 
 # Print training arguments and evaluation results
@@ -428,7 +473,6 @@ python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --data
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets
 python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets
-
 
 # Full fine-tuning (no PEFT)
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0
@@ -466,15 +510,42 @@ python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31
 
 to run
 
+
+
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step15908_dyna_none --dataset_name_or_path scala --use_peft 0 --gpu_device 0
 
 
+
+
 tests
+
+python src/finetune_seq_cls.py --model_name_or_path ../../production/models/munin-7b-core-pt-3 --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --batch_size 8 --gradient_accumulation_steps 16 --learning_rate 2e-5 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --learning_rate 2e-5 --run_name_suffix lukas
+
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 4 --lora_alpha 8 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step7356_cos_giga_distill_full --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step24125_dyna_commonpile --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 128 --lora_r 8 --lora_alpha 16 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-12b-pt --dataset_name_or_path angry_tweets --use_peft 1 --gpu_device 0 --batch_size 8 --gradient_accumulation_steps 16 --lora_r 8 --lora_alpha 16 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --batch_size 8 --gradient_accumulation_steps 16  --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --learning_rate 1e-6 --run_name_suffix lukas
+
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-4b-pt --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --batch_size 8 --gradient_accumulation_steps 16 --freeze_base_model 1 --run_name_suffix lukas
 
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --batch_size 8 --gradient_accumulation_steps 32 --gpu_device 0
 
 python src/finetune_seq_cls.py --model_name_or_path ../new_models/student_step31816_2dyna --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --run_name_suffix lukas
 
-
+python src/finetune_seq_cls.py --model_name_or_path google/gemma-3-1b-pt --dataset_name_or_path angry_tweets --use_peft 0 --gpu_device 0 --weight_decay 0.01 --run_name_suffix lukas
 
 """

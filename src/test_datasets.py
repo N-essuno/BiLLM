@@ -43,9 +43,10 @@ def load_raw_data() -> DatasetDict:
 # res = load_raw_data()
 # print(res)
 
-ds = load_dataset("EuroEval/danske-talemaader", token=hf_token)
-ds_2 = load_dataset("EuroEval/danish-citizen-tests-updated", token=hf_token)
+danske_talemaader = load_dataset("EuroEval/danske-talemaader", token=hf_token)
+danske_citizen_tests = load_dataset("EuroEval/danish-citizen-tests-updated", token=hf_token)
 scandiqa_da = load_dataset("EuroEval/scandiqa-da-mini", token=hf_token)
+angry_tweets = load_dataset("EuroEval/angry-tweets-mini", token=hf_token)
 
 # print(ds)
 # print(ds['train'][1])
@@ -55,7 +56,19 @@ scandiqa_da = load_dataset("EuroEval/scandiqa-da-mini", token=hf_token)
 # print(ds_2)
 # print(ds_2['train'][1])
 
-print("-"*50)
+# print("-"*50)
 
-print(scandiqa_da)
-print(scandiqa_da['train'][1])
+# print(scandiqa_da)
+# print(scandiqa_da['train'][1])
+
+# print("-"*50)
+
+print(angry_tweets)
+print(angry_tweets['train'][1])
+
+# check number of examples for each class in angry_tweets
+print("Angry tweets class distribution:")
+labels, counts = np.unique(angry_tweets['train']['label'], return_counts=True)
+for label, count in zip(labels, counts):
+    print(f"Class {label}: {count} examples")
+
